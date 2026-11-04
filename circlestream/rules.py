@@ -68,6 +68,8 @@ def preflight(x):
     binaries += ["bwa", "samblaster", "awk", "grep", "sed", "sort"] if x.s["platform"] == "illumina" else ["cresil", "minimap2", "mosdepth"]
     x.shell("command -v " + " ".join(binaries))
     x.run(["samtools", "--version"], stdout=x.state / "samtools-version.txt")
+    env_code = "import sys,pathlib,json; root=pathlib.Path(sys.prefix)/'conda-meta'; rows=[json.loads(p.read_text()) for p in sorted(root.glob('*.json'))]; print(json.dumps({'python':sys.version,'prefix':sys.prefix,'packages':[{k:r.get(k) for k in ('name','version','build','subdir')} for r in rows]},indent=2))"
+    x.run(["python", "-c", env_code], stdout=x.state / "environment-packages.json")
     if x.s["platform"] == "nanopore":
         verify_code = "import cresil,pathlib,hashlib; root=pathlib.Path(cresil.__file__).parent; expected={'identify_wgls.py':'093c6c92babf4decc59d3c888ecbc5234fa19a2a','trim.py':'cb50b2f257ad0365660cbb15fdbf5e8ffcafb618'}; actual={n:hashlib.sha1(b'blob '+str(len((root/'cli'/n).read_bytes())).encode()+b'\\0'+(root/'cli'/n).read_bytes()).hexdigest() for n in expected}; print(actual); assert actual==expected, 'CReSIL source differs from pinned revision'"
         x.run(["python", "-c", verify_code], stdout=x.state / "cresil-source-check.txt")
