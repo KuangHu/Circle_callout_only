@@ -1,0 +1,12 @@
+name: circle-short
+channels: [conda-forge, bioconda]
+dependencies:
+  - python=3.11
+  - bwa=0.7.18
+  - samblaster=0.1.26
+  - samtools=1.18
+  - bedtools=2.31.1
+  - gawk
+  - grep
+  - sed
+  - coreutils

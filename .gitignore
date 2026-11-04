@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.snakemake/
+.pytest_cache/
+config.local.json
+samples.local.json
+runtime/
+vendor/
+*.zip

@@ -1,0 +1,448 @@
+"""Separate commands for DTN download and Slurm submission; no remote SSH calls."""
+import argparse
+import csv
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+
+from .common import (GB, REPO, digest, fingerprint, load_config, lock, read_json,
+                     safe_id, set_status, state_paths, tree_size, validate_sample, write_json, workflow_fingerprint)
+
+
+def entries(c):
+    root = Path(c["state_dir"])
+    return sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".") and (p / "spec.json").is_file()) if root.exists() else []
+
+
+def status(path):
+    return read_json(path / "status.json")["status"]
+
+
+def initialize(c, manifest):
+    samples = read_json(manifest)
+    ids = [s["sample_id"] for s in samples]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate sample IDs")
+    for sample in samples:
+        validate_sample(sample)
+    for key in ("state_dir", "scratch_dir", "archive_dir"):
+        Path(c[key]).mkdir(parents=True, exist_ok=True)
+    with lock(Path(c["state_dir"]) / ".init-lock"):
+        config_snapshot = Path(c["state_dir"]) / "config.json"
+        if config_snapshot.exists() and read_json(config_snapshot) != c:
+            raise ValueError("Config changed: use a new state/scratch/archive set for a new benchmark profile")
+        write_json(config_snapshot, c)
+        for sample in samples:
+            state, scratch = state_paths(c, sample["sample_id"])
+            spec = {"config": c, "sample": sample, "repo": str(REPO), "python": sys.executable,
+                    "workflow_sha256": workflow_fingerprint(), "reference_sha256": digest(sample["reference"])}
+            if state.exists():
+                if read_json(state / "spec.json") != spec:
+                    raise ValueError(f"Changed sample or software location: {state.name}; use a new ID/run root")
+                continue
+            if scratch.exists():
+                raise ValueError(f"Unowned scratch directory already exists: {scratch}")
+            pending = state.with_name(".init-"+state.name)
+            pending.mkdir()
+            write_json(pending / "spec.json", spec)
+            set_status(pending, "NEW")
+            os.replace(pending,state)
+    print(f"Initialized {len(samples)} samples; no downloads or jobs started")
+
+
+def check_snapshot(c):
+    if read_json(Path(c["state_dir"]) / "config.json") != c:
+        raise ValueError("Configuration differs from init snapshot; create a separate benchmark run")
+
+
+def admitted(c, sample):
+    active = [p for p in entries(c) if status(p) not in ("NEW", "CLEANED")]
+    reserved = sum(read_json(p / "spec.json")["sample"]["peak_gb"] for p in active)
+    if len(active) >= c["max_active_samples"] or reserved + sample["peak_gb"] > c["scratch_budget_gb"]:
+        return False
+    # Account for remaining reserved expansion, not just currently free bytes.
+    used = tree_size(c["scratch_dir"]) / GB
+    needed = max(0, reserved - used) + sample["peak_gb"] + c["min_free_gb"]
+    return shutil.disk_usage(c["scratch_dir"]).free / GB >= needed
+
+
+def download_file(item, raw, retries):
+    final = raw / item["name"]
+    partial = raw / (item["name"] + ".part")
+    def valid(path):
+        return path.is_file() and path.stat().st_size == item["size_bytes"] and digest(path, "md5") == item["md5"].lower()
+    if valid(final):
+        return
+    if final.exists():
+        raise ValueError(f"Previously finalized input is corrupted: {final}")
+    for attempt in range(retries):
+        if partial.exists() and valid(partial):
+            os.replace(partial, final)
+            return
+        if partial.exists() and partial.stat().st_size >= item["size_bytes"]:
+            partial.unlink()  # only this managed, checksum-invalid download
+        result = subprocess.run([
+            "curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+            "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "120",
+            "--max-filesize", str(item["size_bytes"]), "--continue-at", "-",
+            "--output", str(partial), item["url"]
+        ])
+        if result.returncode == 0 and valid(partial):
+            os.replace(partial, final)
+            return
+        if result.returncode == 33 and partial.exists():
+            partial.unlink()  # server does not support range resume
+        if attempt + 1 < retries:
+            time.sleep(min(30, 2 ** attempt))
+    raise RuntimeError(f"Download/checksum failed after {retries} attempts: {item['name']}")
+
+
+def require_dtn(c):
+    actual = socket.getfqdn().split(".")[0]
+    if actual != c["download_host"].split(".")[0]:
+        raise RuntimeError(f"Run download on configured DTN {c['download_host']}, not {socket.getfqdn()}")
+
+
+def download_one(c, sid=None):
+    require_dtn(c)
+    with lock(Path(c["state_dir"]) / ".download-lock"):
+        for state in entries(c):
+            if sid and state.name != sid:
+                continue
+            if status(state) != "NEW":
+                continue
+            spec = read_json(state / "spec.json")
+            sample = spec["sample"]
+            if not admitted(c, sample):
+                continue
+            _, scratch = state_paths(c, sample["sample_id"])
+            scratch.mkdir(exist_ok=False)
+            write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
+            raw = scratch / "raw"
+            raw.mkdir()
+            set_status(state, "DOWNLOADING")
+            start = time.time()
+            try:
+                for item in sample["files"]:
+                    download_file(item, raw, c["download_retries"])
+                write_json(state / "download.json", {
+                    "seconds": time.time() - start,
+                    "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
+                    "files": sample["files"]
+                })
+                set_status(state, "READY")
+            except Exception as error:
+                set_status(state, "DOWNLOAD_FAILED", error=str(error))
+                raise
+            print(f"Downloaded {sample['sample_id']}", flush=True)
+            return True
+    return False
+
+
+def validate_slurm(c):
+    for key in ("account", "partition", "qos"):
+        value = c["slurm"][key]
+        if not value or "CHANGE_ME" in value or any(x.isspace() for x in value):
+            raise ValueError(f"Set Slurm {key}")
+
+
+def submit_one(c, through="archive", sid=None):
+    validate_slurm(c)
+    with lock(Path(c["state_dir"]) / ".submit-lock"):
+        active = [p for p in entries(c) if status(p) in ("SUBMITTING", "QUEUED", "RUNNING")]
+        if len(active) >= c["max_jobs"]:
+            return False
+        for state in entries(c):
+            if sid and state.name != sid:
+                continue
+            if status(state) != "READY":
+                continue
+            spec = read_json(state / "spec.json")
+            script = state / "job.sh"
+            cmd = [spec["python"], str(REPO / "stream.py"), "worker", "--spec", str(state / "spec.json"), "--through", through]
+            script.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexec " + shlex.join(cmd) + "\n", encoding="utf-8", newline="\n")
+            s = c["slurm"]
+            name = "cs_" + fingerprint(str(state))[:16]
+            set_status(state, "SUBMITTING", job_name=name)
+            # A crash/timeout after sbatch can mean the job exists: never blindly resubmit.
+            result = subprocess.run([
+                "sbatch", "--parsable", "--account", s["account"], "--partition", s["partition"],
+                "--qos", s["qos"], "--cpus-per-task", str(s["cpus"]), "--mem", f"{s['memory_gb']}G",
+                "--time", s["time"], "--job-name", name, "--output", str(state / "slurm-%j.out"), str(script)
+            ], text=True, capture_output=True)
+            (state / "submission.stderr").write_text(result.stderr, encoding="utf-8")
+            if result.returncode != 0:
+                raise RuntimeError(f"Submission uncertain/failed for {state.name}; inspect SUBMITTING state before recovery")
+            jobid = result.stdout.strip().split(";")[0]
+            if not jobid.isdigit():
+                raise RuntimeError(f"Unexpected sbatch response: {result.stdout}")
+            write_json(state / "job.json", {"job_id": jobid, "job_name": name, "submitted": time.time(), "through": through})
+            # Worker may already have started or completed. Do not overwrite its status.
+            print(f"Submitted {state.name}: {jobid}", flush=True)
+            return True
+    return False
+
+
+def stage_local(c, sid, inputs):
+    """Copy existing cluster fixtures into owned scratch; never delete source inputs."""
+    state, scratch = state_paths(c, sid)
+    with lock(Path(c["state_dir"]) / ".download-lock"):
+        if status(state) != "NEW":
+            raise ValueError("stage-local requires NEW sample")
+        spec = read_json(state / "spec.json")
+        sample = spec["sample"]
+        if len(inputs) != len(sample["files"]) or not admitted(c, sample):
+            raise ValueError("Wrong input count or insufficient reserved capacity")
+        for source,item in zip(inputs,sample["files"]):
+            if Path(source).stat().st_size != item["size_bytes"] or digest(source,"md5") != item["md5"].lower():
+                raise ValueError("Local input does not match manifest")
+        scratch.mkdir(exist_ok=False)
+        write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
+        (scratch / "raw").mkdir()
+        set_status(state,"DOWNLOADING")
+        start=time.time()
+        try:
+            for source,item in zip(inputs,sample["files"]):
+                target=scratch / "raw" / item["name"]
+                shutil.copy2(source,target)
+                if digest(target,"md5") != item["md5"].lower():
+                    raise ValueError("Staged input checksum mismatch")
+            write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,
+                "compressed_bytes":sum(f["size_bytes"] for f in sample["files"])})
+            set_status(state,"READY")
+        except Exception as error:
+            set_status(state,"DOWNLOAD_FAILED",error=str(error))
+            raise
+
+
+def worker(spec_path, through):
+    spec = read_json(spec_path)
+    c, sample = spec["config"], spec["sample"]
+    state, scratch = state_paths(c, sample["sample_id"])
+    if spec["workflow_sha256"] != workflow_fingerprint():
+        raise ValueError("Workflow changed since init; use a separate run root rather than reuse old rule markers")
+    if not os.environ.get("SLURM_JOB_ID"):
+        raise RuntimeError("worker must run inside a Slurm allocation; unit tests do not invoke real callers")
+    with lock(state / ".worker-lock"):
+        if status(state) not in ("SUBMITTING", "READY", "RETRY_READY"):
+            raise RuntimeError(f"Cannot start worker from {status(state)}")
+        set_status(state, "RUNNING", job_id=os.environ["SLURM_JOB_ID"], started=time.time())
+        work = scratch / "work"
+        work.mkdir(exist_ok=True)
+        target = {"preflight": "preflight.ok", "qc": "qc.ok", "reference": "reference.ok", "mapping": "mapping.ok",
+                  "call": "call.ok", "evidence": "evidence.ok", "archive": "archive.ok"}[through]
+        cmd = [spec["python"], "-m", "snakemake", "--snakefile", str(REPO / "workflow" / "Snakefile"),
+               "--directory", str(work), "--cores", str(c["slurm"]["cpus"]), "--rerun-incomplete",
+               "--config", f"spec={Path(spec_path).resolve()}", "--", target]
+        try:
+            subprocess.run(cmd, check=True)
+            set_status(state, "ARCHIVED" if through == "archive" else "PAUSED", through=through)
+        except Exception as error:
+            set_status(state, "COMPUTE_FAILED", error=str(error))
+            raise
+
+
+def verify_bundle(state):
+    receipt = read_json(state / "archive.json")
+    bundle = Path(receipt["path"])
+    if digest(bundle) != receipt["sha256"]:
+        raise ValueError("Archive checksum mismatch; refusing cleanup")
+    with tarfile.open(bundle, "r:gz") as archive:
+        manifest = json.load(archive.extractfile("MANIFEST.json"))
+        if json.load(archive.extractfile("metadata/spec.json")) != read_json(state / "spec.json"):
+            raise ValueError("Archive belongs to a different sample or run")
+        names = [m.name for m in archive.getmembers()]
+        if len(names) != len(set(names)) or set(names) != set(manifest) | {"MANIFEST.json"}:
+            raise ValueError("Archive member set mismatch")
+        import hashlib
+        for name, expected in manifest.items():
+            member = archive.getmember(name)
+            if not member.isfile():
+                raise ValueError("Non-file archive member")
+            h = hashlib.sha256()
+            with archive.extractfile(member) as handle:
+                for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                    h.update(block)
+            if h.hexdigest() != expected:
+                raise ValueError(f"Archive member checksum mismatch: {name}")
+    return receipt
+
+
+def reconcile_archive(c, sid):
+    state, scratch = state_paths(c,sid)
+    with lock(state / ".cleanup-lock"):
+        if (state/".worker-lock").exists():
+            raise ValueError("Worker lock present: confirm job completion before archive recovery")
+        old = status(state)
+        if old not in ("ARCHIVED","CLEANED"):
+            if not (state/"job.json").exists():
+                raise ValueError("No job ID available; reconcile ambiguous submission first")
+            jid=read_json(state/"job.json")["job_id"]
+            result=subprocess.run(["sacct","-X","-n","-P","-j",jid,"--format=JobIDRaw,State"],check=True,capture_output=True,text=True)
+            rows=[l.split("|") for l in result.stdout.splitlines() if l.split("|")[0]==jid]
+            if not rows or rows[0][1].split()[0].rstrip("+") not in {"COMPLETED","FAILED","CANCELLED","TIMEOUT","OUT_OF_MEMORY","NODE_FAIL","PREEMPTED","BOOT_FAIL","DEADLINE"}:
+                raise ValueError("Job active or unknown")
+        receipt=read_json(state/"archive.json")
+        final=Path(c["archive_dir"])/(sid+".tar.gz")
+        partial=Path(c["archive_dir"])/(sid+".partial.tar.gz")
+        if Path(receipt["path"]) not in (final,partial):
+            raise ValueError("Unexpected archive path")
+        if not Path(receipt["path"]).exists() and final.exists() and digest(final)==receipt["sha256"]:
+            receipt["path"]=str(final);write_json(state/"archive.json",receipt)
+        verify_bundle(state)
+        if Path(receipt["path"])==partial:
+            if final.exists():
+                raise ValueError("Both partial and final exist; review before overwrite")
+            os.replace(partial,final)
+            receipt["path"]=str(final);write_json(state/"archive.json",receipt)
+        if old!="CLEANED":
+            set_status(state,"ARCHIVED",reconciled=True)
+        print(f"Archive verified: {sid}")
+
+
+def cleanup(c, sid):
+    state, scratch = state_paths(c, sid)
+    with lock(state / ".cleanup-lock"):
+        if status(state) == "CLEANED":
+            return
+        if status(state) != "ARCHIVED":
+            raise ValueError("Cleanup requires ARCHIVED status")
+        verify_bundle(state)
+        spec = read_json(state / "spec.json")
+        root = Path(c["scratch_dir"]).resolve()
+        if scratch.is_symlink() or scratch.resolve().parent != root or scratch.name != safe_id(sid):
+            raise ValueError("Unsafe cleanup target")
+        if scratch.exists():
+            if read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}:
+                raise ValueError("Scratch ownership mismatch")
+            if (state / ".worker-lock").exists():
+                raise ValueError("Worker still holds lock")
+            # Reject all symlinks to avoid following caller-created links in cleanup.
+            if any(p.is_symlink() for p in scratch.rglob("*")):
+                raise ValueError("Symlink in scratch; manual review required")
+            shutil.rmtree(scratch)
+        set_status(state, "CLEANED")
+        print(f"Cleaned {sid}; verified bundle retained", flush=True)
+
+
+def recover(c, sid):
+    """Explicit operator action, not automatic retry of ambiguous Slurm submissions."""
+    state, scratch = state_paths(c, sid)
+    current = status(state)
+    for name in (".worker-lock", ".cleanup-lock"):
+        if (state / name).exists():
+            raise ValueError(f"Inspect stale lock first: {state / name}")
+    if current in ("DOWNLOAD_FAILED", "DOWNLOADING"):
+        require_dtn(c)
+        if (Path(c["state_dir"]) / ".download-lock").exists():
+            raise ValueError("Download lock is still present")
+        with lock(Path(c["state_dir"]) / ".download-lock"):
+            spec = read_json(state / "spec.json")
+            if read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}:
+                raise ValueError("Ownership mismatch")
+            set_status(state, "DOWNLOADING")
+            start = time.time()
+            try:
+                for item in spec["sample"]["files"]:
+                    download_file(item, scratch / "raw", c["download_retries"])
+                write_json(state / "download.json", {"seconds": time.time()-start, "resumed": True,
+                    "compressed_bytes": sum(f["size_bytes"] for f in spec["sample"]["files"])})
+                set_status(state, "READY")
+            except Exception as error:
+                set_status(state, "DOWNLOAD_FAILED", error=str(error))
+                raise
+    elif current in ("COMPUTE_FAILED", "PAUSED", "RUNNING", "SUBMITTING"):
+        job = state / "job.json"
+        if not job.exists():
+            raise ValueError("Missing job ID: inspect squeue/sacct using status.json job_name; reconcile manually")
+        jid = read_json(job)["job_id"]
+        check = subprocess.run(["sacct", "-X", "-n", "-P", "-j", jid, "--format=JobIDRaw,State"],
+                               check=True, capture_output=True, text=True)
+        rows = [l.split("|") for l in check.stdout.splitlines() if l.split("|")[0] == jid]
+        terminal = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
+        if not rows or rows[0][1].split()[0].rstrip("+") not in terminal:
+            raise ValueError("Job is active or accounting unavailable: do not retry")
+        # Preserve failed partial results and benchmarks. Rules rerun with isolated caller outputs.
+        set_status(state, "READY", recovered_job=jid)
+    else:
+        raise ValueError(f"Cannot recover state {current}")
+
+
+def report(c):
+    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    writer.writerow(["sample", "platform", "status", "download_seconds", "input_bytes", "rule", "wall_seconds", "cpu_seconds", "max_rss_kb", "sampled_peak_scratch_bytes", "exit_code"])
+    for state in entries(c):
+        spec = read_json(state / "spec.json")
+        d = read_json(state / "download.json") if (state / "download.json").exists() else {}
+        metrics = sorted((state / "metrics").glob("*.json")) or [None]
+        for m in metrics:
+            r = read_json(m) if m else {}
+            writer.writerow([state.name, spec["sample"]["platform"], status(state), d.get("seconds", ""),
+                d.get("compressed_bytes", ""), r.get("rule", ""), r.get("wall_seconds", ""), r.get("cpu_seconds", ""),
+                r.get("max_rss_kb", ""), r.get("sampled_peak_scratch_bytes", ""), r.get("exit_code", "")])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("command", choices=["init", "download", "stage-local", "submit", "cleanup", "verify", "recover", "status", "report", "worker"])
+    ap.add_argument("--config", default="config.local.json")
+    ap.add_argument("--manifest", default="samples.local.json")
+    ap.add_argument("--sample")
+    ap.add_argument("--spec")
+    ap.add_argument("--inputs", nargs="+")
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--through", choices=["preflight", "qc", "reference", "mapping", "call", "evidence", "archive"], default="archive")
+    a = ap.parse_args()
+    if a.command == "worker":
+        worker(a.spec, a.through)
+        return
+    c = load_config(a.config)
+    if a.command == "init":
+        initialize(c, a.manifest)
+        return
+    check_snapshot(c)
+    if a.sample:
+        safe_id(a.sample)
+        if not (Path(c["state_dir"])/a.sample/"spec.json").is_file():
+            raise ValueError("Unknown sample ID")
+    if a.command == "stage-local":
+        if not a.sample or not a.inputs:
+            ap.error("stage-local requires --sample and --inputs")
+        stage_local(c,a.sample,a.inputs)
+        return
+    if a.command == "status":
+        for p in entries(c):
+            print(p.name, json.dumps(read_json(p / "status.json")))
+        return
+    if a.command == "report":
+        report(c)
+        return
+    if a.command in ("cleanup", "recover", "verify"):
+        if not a.sample:
+            ap.error("--sample required")
+        {"cleanup":cleanup,"recover":recover,"verify":reconcile_archive}[a.command](c, a.sample)
+        return
+    while True:
+        if a.command == "submit" and c["auto_cleanup"]:
+            for p in entries(c):
+                if status(p) == "ARCHIVED" and not (p / ".worker-lock").exists():
+                    cleanup(c, p.name)
+        try:
+            progressed = download_one(c,a.sample) if a.command == "download" else submit_one(c, a.through,a.sample)
+        except Exception as error:
+            if not a.watch:
+                raise
+            print(f"Held for review: {error}", file=sys.stderr, flush=True)
+            progressed = False
+        if not a.watch:
+            break
+        if all(status(p) == "CLEANED" for p in entries(c)):
+            break
+        time.sleep(1 if progressed else c["poll_seconds"])

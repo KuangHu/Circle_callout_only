@@ -1,0 +1,50 @@
+import json
+import sys
+from pathlib import Path
+
+SPEC = str(Path(config["spec"]).resolve())
+S = json.loads(Path(SPEC).read_text())
+REPO = S["repo"]
+PYTHON = S["python"]
+NCPU = S["config"]["slurm"]["cpus"]
+
+rule all:
+    input: "archive.ok"
+
+rule preflight:
+    output: "preflight.ok"
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule preflight"
+
+rule qc:
+    input: "preflight.ok"
+    output: "qc.ok"
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule qc"
+
+rule reference:
+    input: "qc.ok"
+    output: "reference.ok"
+    threads: NCPU
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule reference"
+
+rule mapping:
+    input: "reference.ok"
+    output: "mapping.ok"
+    threads: NCPU
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule mapping"
+
+rule call:
+    input: "mapping.ok"
+    output: "call.ok"
+    threads: NCPU
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule call"
+
+rule evidence:
+    input: "call.ok"
+    output: "evidence.ok"
+    threads: NCPU
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule evidence"
+
+rule archive:
+    input: "evidence.ok"
+    output: "archive.ok"
+    shell: "{PYTHON:q} {REPO:q}/run_rule.py --spec {SPEC:q} --rule archive"

@@ -1,0 +1,25 @@
+[
+  {
+    "sample_id": "ont_example",
+    "accession": "REPLACE_WITH_RUN_ACCESSION",
+    "platform": "nanopore",
+    "library": "wgs",
+    "reference": "/CHANGE_ME/references/sample_genome.fa",
+    "peak_gb": 80,
+    "files": [
+      {"name": "reads.fastq.gz", "url": "https://REPLACE/reads.fastq.gz", "size_bytes": 1000000000, "md5": "REPLACE_WITH_SOURCE_MD5"}
+    ]
+  },
+  {
+    "sample_id": "illumina_example",
+    "accession": "REPLACE_WITH_RUN_ACCESSION",
+    "platform": "illumina",
+    "library": "wgs",
+    "reference": "/CHANGE_ME/references/sample_genome.fa",
+    "peak_gb": 80,
+    "files": [
+      {"name": "reads_1.fastq.gz", "url": "https://REPLACE/reads_1.fastq.gz", "size_bytes": 1000000000, "md5": "REPLACE_WITH_SOURCE_MD5"},
+      {"name": "reads_2.fastq.gz", "url": "https://REPLACE/reads_2.fastq.gz", "size_bytes": 1000000000, "md5": "REPLACE_WITH_SOURCE_MD5"}
+    ]
+  }
+]

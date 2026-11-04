@@ -1,0 +1,32 @@
+{
+  "state_dir": "/CHANGE_ME/persistent/circle-stream-state",
+  "scratch_dir": "/CHANGE_ME/scratch/circle-stream",
+  "archive_dir": "/CHANGE_ME/persistent/circle-stream-results",
+  "scratch_budget_gb": 500,
+  "min_free_gb": 30,
+  "max_active_samples": 4,
+  "max_jobs": 2,
+  "download_host": "lrc-xfer.lbl.gov",
+  "download_retries": 3,
+  "poll_seconds": 60,
+  "auto_cleanup": false,
+  "slurm": {
+    "account": "CHANGE_ME",
+    "partition": "CHANGE_ME",
+    "qos": "CHANGE_ME",
+    "cpus": 8,
+    "memory_gb": 32,
+    "time": "04:00:00"
+  },
+  "tools": {
+    "illumina_prefix": ["conda", "run", "--no-capture-output", "-n", "circle-short"],
+    "nanopore_prefix": ["conda", "run", "--no-capture-output", "-n", "cresil"]
+  },
+  "caller": {
+    "cresil_mode": "depth",
+    "min_region_size": 200,
+    "breakpoint_depth": 3,
+    "average_depth": 5,
+    "circle_finder_min_non_overlap": 10
+  }
+}
