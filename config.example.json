@@ -16,7 +16,8 @@
     "qos": "CHANGE_ME",
     "cpus": 8,
     "memory_gb": 32,
-    "time": "04:00:00"
+    "time": "02:00:00",
+    "setup_commands": []
   },
   "tools": {
     "illumina_prefix": ["conda", "run", "--no-capture-output", "-n", "circle-short"],

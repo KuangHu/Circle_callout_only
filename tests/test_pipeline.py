@@ -9,9 +9,9 @@ import unittest
 from unittest.mock import patch
 
 from circlestream.common import GB, REPO, digest, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
-from circlestream.controller import admitted, cleanup, download_file, initialize, reconcile_archive, recover, stage_local, status, submit_one, verify_bundle
+from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm
 from circlestream.fastq import extract, materialize
-from circlestream.rules import Context, archive, cf_lines
+from circlestream.rules import Context, archive, cf_lines, copy_caller_evidence
 from scripts.cresil_wgls_checked import execute, strict_call
 from types import SimpleNamespace
 
@@ -240,6 +240,172 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("microDNA-JT.txt",calling[-1])
         self.assertFalse(any(l.startswith("rm ") for l in mapping+calling))
         self.assertFalse(any(l.startswith("bwa mem") for l in calling))
+
+    def test_held_samples_release_admission_slots_but_keep_disk_reservation(self):
+        self.staged()
+        self.c["max_active_samples"] = 1
+        self.assertFalse(admitted(self.c, self.s))
+        for held in ("COMPUTE_FAILED", "DOWNLOAD_FAILED", "CLEANUP_FAILED"):
+            set_status(self.state, held)
+            self.assertTrue(admitted(self.c, self.s))
+            self.c["scratch_budget_gb"] = 0.015
+            self.assertFalse(admitted(self.c, self.s))
+            self.c["scratch_budget_gb"] = 1
+
+    def test_killed_job_releases_slot_without_unlocking_or_retrying(self):
+        self.staged()
+        set_status(self.state, "RUNNING")
+        write_json(self.state / "job.json", {"job_id": "123"})
+        write_json(self.manifest, [self.s, dict(self.s, sample_id="test2")])
+        initialize(self.c, self.manifest)
+        stage_local(self.c, "test2", [self.raw])
+        self.c["max_jobs"] = 1
+        calls = []
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd[0])
+            output = {"sacct": "123|OUT_OF_MEMORY|\n", "squeue": "", "sbatch": "456\n"}[cmd[0]]
+            return subprocess.CompletedProcess(cmd, 0, output, "")
+        with lock(self.state / ".worker-lock"), patch("circlestream.controller.subprocess.run", side_effect=fake_run):
+            self.assertTrue(submit_one(self.c))
+            self.assertTrue((self.state / ".worker-lock").exists())
+        self.assertEqual(calls, ["sacct", "squeue", "sbatch"])
+        self.assertEqual(status(self.state), "COMPUTE_FAILED")
+        self.assertTrue(self.scratch.is_dir())
+        self.assertEqual(read_json(self.state / "job.json")["job_id"], "123")
+        self.assertEqual(read_json(self.state.parent / "test2" / "job.json")["job_id"], "456")
+
+    def test_scheduler_unknown_running_and_requeued_remain_active(self):
+        set_status(self.state, "RUNNING")
+        write_json(self.state / "job.json", {"job_id": "123"})
+        for accounting, queue in (("", ""), ("123|RUNNING|\n", "123\n"),
+                                   ("123|PREEMPTED|\n", "123\n"), ("123.batch|FAILED|\n", "")):
+            results = [subprocess.CompletedProcess([], 0, accounting, ""),
+                       subprocess.CompletedProcess([], 0, queue, "")]
+            with patch("circlestream.controller.subprocess.run", side_effect=results):
+                reconcile_jobs(self.c)
+            self.assertEqual(status(self.state), "RUNNING")
+        with patch("circlestream.controller.subprocess.run", side_effect=subprocess.TimeoutExpired("sacct", 30)):
+            reconcile_jobs(self.c)
+        self.assertEqual(status(self.state), "RUNNING")
+
+    def test_reconciliation_does_not_overwrite_worker_final_status(self):
+        set_status(self.state, "RUNNING")
+        write_json(self.state / "job.json", {"job_id": "123"})
+        def fake_run(cmd, **kwargs):
+            set_status(self.state, "ARCHIVED")
+            return subprocess.CompletedProcess(cmd, 0, "123|COMPLETED|\n" if cmd[0] == "sacct" else "", "")
+        with patch("circlestream.controller.subprocess.run", side_effect=fake_run):
+            reconcile_jobs(self.c)
+        self.assertEqual(status(self.state), "ARCHIVED")
+
+    def test_one_bad_cleanup_does_not_stop_next_sample(self):
+        self.archived()
+        write_json(self.manifest, [self.s, dict(self.s, sample_id="test2")])
+        initialize(self.c, self.manifest)
+        stage_local(self.c, "test2", [self.raw])
+        state2 = self.state.parent / "test2"
+        scratch2 = self.scratch.parent / "test2"
+        shutil.copytree(self.scratch / "work", scratch2 / "work")
+        write_json(state2 / "calls.json", {"candidate_count": 0})
+        write_json(state2 / "evidence.json", {"read_ids": 0})
+        archive(Context(read_json(state2 / "spec.json")))
+        set_status(state2, "ARCHIVED")
+        # An actual damaged archive, not a mocked cleanup failure.
+        bundle = Path(read_json(self.state / "archive.json")["path"])
+        good = bundle.read_bytes()
+        bundle.write_bytes(good + b"corruption")
+        cleanup_archived(self.c)
+        self.assertEqual(status(self.state), "CLEANUP_FAILED")
+        self.assertTrue(self.scratch.exists())
+        self.assertEqual(status(state2), "CLEANED")
+        self.assertFalse(scratch2.exists())
+        bundle.write_bytes(good)
+        reconcile_archive(self.c, "test1")
+        cleanup_archived(self.c)
+        self.assertEqual(status(self.state), "CLEANED")
+
+    def test_job_setup_commands_are_in_script_before_worker(self):
+        self.staged()
+        self.c["slurm"]["setup_commands"] = ["source /etc/profile", "module load miniforge3"]
+        with patch("circlestream.controller.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "123\n", "")):
+            submit_one(self.c)
+        script = (self.state / "job.sh").read_text()
+        self.assertLess(script.index("module load miniforge3"), script.index("exec "))
+        self.c["slurm"]["setup_commands"] = "module load miniforge3"
+        with self.assertRaises(ValueError): validate_slurm(self.c)
+
+    def test_illumina_retention_excludes_whole_library_tables(self):
+        out = self.root / "caller"; out.mkdir()
+        ev = self.root / "evidence"; ev.mkdir()
+        keep = ["sample-ref.microDNA-JT.txt", "sample-ref.split.txt", "sample-ref.split.id-freq.txt",
+                "sample-ref.split_freq2.oneline.txt", "sample-ref.disc.txt"]
+        omit = ["sample-ref.concordant.txt", "sample-ref.concordant.id-freq.txt",
+                "sample-ref.concordant_freqGr3.txt", "sample-ref.sorted.bam", "unrelated.txt"]
+        for name in keep + omit: (out / name).write_text("records\n")
+        copy_caller_evidence(out, ev, "illumina", set())
+        self.assertTrue(all((ev / name).is_file() for name in keep))
+        self.assertFalse(any((ev / name).exists() for name in omit))
+        retained = read_json(ev / "caller-retention.json")
+        self.assertEqual({p["path"] for p in retained["copied_files"]}, set(keep))
+        self.assertGreater(retained["caller_bytes_not_copied_verbatim"], 0)
+
+    def test_ont_retention_keeps_graphs_and_only_support_trim_rows(self):
+        out = self.root / "caller"; out.mkdir()
+        ev = self.root / "evidence"; ev.mkdir()
+        keep = ["eccDNA_final.txt", "cresil_run/subGraphs.summary.txt",
+                "cresil_run/assemGraph/ecc1/final_reads.fa", "cresil_run/assemGraph/ecc1/reference_regions.fa"]
+        omit = ["cresil_run/tmp/merge_genomecov.txt", "cresil_run/tmp/ref_aln.regions.bed.gz",
+                "cresil_run/tmp/ref_aln.bam", "unrecognized.txt"]
+        for name in keep + omit:
+            p = out / name; p.parent.mkdir(parents=True, exist_ok=True); p.write_text("data\n")
+        (out / "trim.txt").write_text("readid\tq_start\tq_end\na\t0\t100\nb\t0\t100\na\t100\t200\n")
+        copy_caller_evidence(out, ev, "nanopore", {"a"})
+        self.assertTrue(all((ev / "cresil" / name).is_file() for name in keep))
+        self.assertFalse(any((ev / "cresil" / name).exists() for name in omit + ["trim.txt"]))
+        self.assertEqual((ev / "cresil" / "trim.support.txt").read_text(), "readid\tq_start\tq_end\na\t0\t100\na\t100\t200\n")
+        self.assertEqual(read_json(ev / "caller-retention.json")["support_trim_rows"], 2)
+
+    def test_ont_zero_support_retains_trim_header(self):
+        out = self.root / "caller"; out.mkdir()
+        ev = self.root / "evidence"; ev.mkdir()
+        (out / "trim.txt").write_text("readid\tq_start\na\t0\n")
+        copy_caller_evidence(out, ev, "nanopore", set())
+        self.assertEqual((ev / "cresil" / "trim.support.txt").read_text(), "readid\tq_start\n")
+
+    def test_two_sample_download_submit_archive_cleanup_cycle(self):
+        # Exercise real control/archiving code with fake HTTPS transport and Slurm.
+        # Fake caller products do NOT test biological correctness.
+        write_json(self.manifest, [self.s, dict(self.s, sample_id="test2")])
+        initialize(self.c, self.manifest)
+        self.c["max_active_samples"] = 1
+        self.c["max_jobs"] = 1
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "curl":
+                shutil.copyfile(self.raw, cmd[cmd.index("--output") + 1])
+                return subprocess.CompletedProcess(cmd, 0)
+            self.assertEqual(cmd[0], "sbatch")
+            return subprocess.CompletedProcess(cmd, 0, "123\n", "")
+        with patch("circlestream.controller.socket.getfqdn", return_value=self.c["download_host"]), \
+             patch("circlestream.controller.subprocess.run", side_effect=fake_run):
+            for sid in ("test1", "test2"):
+                self.assertTrue(download_one(self.c))
+                self.assertFalse(download_one(self.c))
+                self.assertTrue(submit_one(self.c))
+                state = self.state.parent / sid
+                x = Context(read_json(state / "spec.json"))
+                ev = x.work / "evidence"; ev.mkdir(parents=True)
+                (ev / "support.bam").write_bytes(b"fake-caller-product")
+                shutil.copy2(self.ref, ev / "reference.fa")
+                write_json(state / "calls.json", {"candidate_count": 0})
+                write_json(state / "evidence.json", {"read_ids": 0})
+                archive(x)
+                set_status(state, "ARCHIVED")
+                cleanup_archived(self.c)
+                self.assertEqual(status(state), "CLEANED")
+                self.assertFalse(x.scratch.exists())
+                verify_bundle(state)
+            self.assertFalse(download_one(self.c))
+            self.assertFalse(submit_one(self.c))
 
 
 if __name__=="__main__": unittest.main()

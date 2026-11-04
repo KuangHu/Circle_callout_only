@@ -70,6 +70,10 @@ python stream.py init --config config.local.json --manifest samples.local.json
 
 `slurm.account/partition/qos` 按自己的 LRC association 填写。路径不要有空格或 shell 特殊字符，因为上游 CReSIL 内部仍会构建 shell 命令。
 
+LRC 初测注意：`lr_debug` 上限为 3 小时，示例现在用 2 小时。`lr6` 是 exclusive 节点；申请 8 核不等于按 8 核消耗资源。请以 `scontrol show partition lr6`、`sinfo -p lr6 -N -o '%N %c %m'` 和自己的 association 为准，选择有权限的共享分区，或按整节点预算做测试。增加线程数不保证 caller 等比例加速。项目账号的实际收费/配额方式需按账号核对，不能一概视为现金账单。
+
+作业可显式加载环境：在 `slurm` 中设置 `"setup_commands": ["source /etc/profile", "module load miniforge3"]`（模块名先在本站确认）。这些是按顺序执行的 Bash 命令，失败会停止作业；配置会随 spec 冻结。默认空列表仍依赖提交时的环境。`init` 须在 `circle-control` 中执行，使保存的 Python 路径指向安装了 Snakemake 的环境。
+
 容量单位为十进制 GB。每个样本的 `peak_gb` 应包含下载、解压后的 FASTQ/FASTA、所有比对副本、排序临时文件、caller 和 evidence。Circle_finder 原版保留多份 SAM/BAM，初测不要只按压缩 FASTQ 的两倍估算。
 
 `scratch_budget_gb` 是本流水线的预算，不会修改文件系统 quota。执行 rule 时每 5 秒采样一次目录大小，超过样本 reservation 会终止该进程组并保留现场；**它不是绝对的硬磁盘限额**，瞬时峰值可能漏采。archive 可用空间另行检查。共享文件系统其他用户造成的空间变化仍可能导致任务失败。
@@ -135,6 +139,12 @@ python stream.py submit --config production.json --watch
 
 待处理清单有限，处理完所有样本后退出。可以用同一配置再次 `init` 添加新的 sample IDs，已登记样本必须保持不变。下载校验最多自动重试配置次数；计算失败保留现场，需显式恢复，防止无限消耗 SU。
 
+每次提交前，提交器用 `sacct` 查已知 job ID，并用 `squeue` 确认它不再运行/排队。被杀而残留 RUNNING 的样本会进入 COMPUTE_FAILED、释放计算名额；不会删除其 worker lock，也不会自动重跑。查不到终态、查询失败、或 SUBMITTING 没有 job ID 时仍保留名额，避免重复计算。
+
+一个归档清理失败会标为 CLEANUP_FAILED，其他样本继续。DOWNLOAD_FAILED / COMPUTE_FAILED / CLEANUP_FAILED 不占 active-sample 名额，但**仍保留完整磁盘 reservation**。因此成功样本能持续循环；失败数据积压或持久 archive 满时必须处理，不能保证无人维护地无限运行。空闲轮询会打印状态统计，便于发现等待/积压。
+
+上述恢复依赖两个控制进程继续运行。DTN/提交器进程被杀、机器重启或全局锁残留仍需恢复；不要在未确认旧进程停止时自动删除锁。
+
 ## 结果与清理
 
 ```bash
@@ -146,14 +156,15 @@ python stream.py cleanup --config config.local.json --sample ont_example
 
 归档保存：
 
-- Circle_finder 的所有 split/discordant read IDs 对应的完整原始 FASTQ（含 mates、quality）、这些模板在完整 mapping BAM 中的所有 records、caller 文本结果。
-- CReSIL 所有报告 graph（含 acyclic）的支持 read IDs 对应的完整原始 FASTQ；重新对全 reference 比对，保存 CIGAR/SA/secondary records；graph 表、reference-derived sequences、read fragments、trim 表等。重新比对的 BAM **不是原始 trim 内部 mappy alignment**；原 trim 表也被保留。
+- Circle_finder 的所有 split/discordant read IDs 对应的完整原始 FASTQ（含 mates、quality）、这些模板在完整 mapping BAM 中的所有 records、split/disc 文本和 microDNA-JT。全库 concordant 文本及 read-ID 频次表不进入归档。
+- CReSIL 所有报告 graph（含 acyclic）的支持 read IDs 对应的完整原始 FASTQ；重新对全 reference 比对，保存 CIGAR/SA/secondary records；eccDNA_final、subGraphs.summary、graph 的 reference_regions.fa / final_reads.fa、仅支持 reads 的原始 trim 行（trim.support.txt）。重新比对的 BAM **不是原始 trim 内部 mappy alignment**。全库 trim 和 coverage/tmp 不进入归档。
 - 完整 reference FASTA/FAI、代码快照、参数、MD5、版本、日志、已完成的 rule measurements。
 - 零候选也保存有明确状态的结果。空 trim/不匹配参考/未识别软件错误不自动当作阴性。
 
 不会保留完整原始文库或所有背景 BAM。未来若要更换参考/算法全面重分析，需要按 accession/URL 重新下载。当前 evidence 不完成 tandem/linear alternative 的自动排除；需要后续复核。CReSIL graph-derived sequence 不能冒称新 assembly consensus。
 
 `archive` 自身的测量、最终状态和 Slurm stdout 留在持久 state 目录；归档里是打包前的状态快照。保守证据策略可能仍然占较多空间，benchmark 必须测结果保留量。
+每个 evidence 目录的 `caller-retention.json` 列出复制的 caller 文件和字节数、未原样复制的字节数、保留的 trim 行数；`evidence.json` 记录总保留量。支持 read 集合很大时，归档仍可能很大。
 
 ## 恢复
 
@@ -161,6 +172,7 @@ python stream.py cleanup --config config.local.json --sample ont_example
 - `SUBMITTING` + 没有 job ID：`sbatch` 可能已被接受。按 `status.json` 中的 job_name 查询 `squeue/sacct`，补齐正确 `job.json` 后再恢复；**不要直接改回 NEW**。
 - 超时/OOM：确认 Slurm 终态。处理残留 `.worker-lock` 和 Snakemake lock 前，必须确认没有进程继续使用该目录。失败的 caller 输出会被重命名保存，不混入重跑。
 - 已生成归档但状态未更新：先执行 `python stream.py verify --config ... --sample ID`，仅在验证和 job 终态确认后收敛到 ARCHIVED。
+- CLEANUP_FAILED：检查 `status.json` 的原因，修复问题后执行 `verify --sample ID` 重新校验并回到 ARCHIVED；下一次 submit 轮询会再尝试清理。归档不通过校验时不会释放 scratch。
 - 软件/参考版本改变：新 run roots，避免复用旧结果。需要改变 memory/时间等资源时也使用新配置；可用 `stage-local` 复用保留的下载副本。
 
 ## 验证与限制

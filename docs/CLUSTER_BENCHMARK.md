@@ -76,12 +76,16 @@ CReSIL WGLS `depth` 模式会在 call 内部再次比对并计算 coverage，因
 - 在另一套测试归档中修改一个字节：cleanup 必须拒绝。
 - CReSIL 输出 `no_candidates.json` 时：确认不是零 mapping、依赖错误或 traceback。wrapper 只接受固定版本三个明确无候选出口，其余失败不会被算作阴性。
 - 检查 scratch 超限或 Slurm kill 后所有子进程都已停止，才能人工处理 stale locks。
+- 用专用的小测试作业制造一次超时/取消：让另一个样本处于 READY。确认 watcher 在 sacct 终态且 squeue 不再列出该作业后，将旧样本标为 COMPUTE_FAILED，保留旧 scratch 和 worker lock，并提交 READY 样本。accounting 不可用时应保留旧名额。
+- 同时准备两个已归档的测试样本，破坏其中一个归档：watcher 应将它标为 CLEANUP_FAILED、保留其 scratch，继续清理另一个；下载预算仍包含失败样本。
+- 两个真实的小样本做一次完整接力，配置 max_active_samples=1、max_jobs=1、auto_cleanup=true（独立测试 roots）：A 完成且归档验证后清理，B 才开始下载；所有样本 CLEANED 后两个 watcher 都退出。
+- 检查 evidence/caller-retention.json：Illumina 不含全库 concordant 表；ONT 不含全库 trim、coverage/tmp；支持 read 的完整序列和所需证据仍在。
 
 ## 4. 真实数据效率
 
 Nanopore 和 Illumina 各取小/中/大数据集各两个。优先微生物普通 WGS，分别记录 isolate/metagenome、read length、参考来源与可比对比例。不把人类/RCA/ATAC 和微生物 WGS 合并统计。
 
-先 8 核；每个平台选一个完整代表样本，在独立 run roots 用 4/8/16 核比较。不使用仅含已知 junction 的 read 子集测全流程性能。不同线程下候选差异必须检查；不只追求速度。
+先检查 partition 的共享/独占策略和节点核数。可共享分区上可从 8 核开始，在独立 run roots 比较 4/8/16 核。lr6 独占节点上，小线程数仍占整节点；若做线程缩放实验，每次都按整节点成本计，另加一个整节点线程数的对照，不把申请 cpus 当作计费核数。不要仅因为可用 32 核便认定 caller 会快 4 倍。不使用仅含已知 junction 的 read 子集测全流程性能；不同线程下候选差异也必须检查。
 
 每次原始下载独立记录，复用 input/已缓存文件时标注，不把缓存命中当外网带宽。v0.1 每个样本独立建参考索引，避免共享索引的并发污染；若索引是主要开销，再做按 reference hash 共享缓存。
 

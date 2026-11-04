@@ -198,6 +198,52 @@ def call(x):
             "all_graph_count": len(rows), "classification": "cyclic_graph_candidate_not_topology_proof", "caller": "CReSIL"})
 
 
+def copy_caller_evidence(out, ev, platform, wanted):
+    """Explicit allowlist: never archive whole-library/depth intermediates."""
+    selected = []
+    omitted_bytes = 0
+    for p in out.rglob("*"):
+        if p.is_symlink():
+            raise ValueError("Unexpected symlink in caller output")
+        if not p.is_file():
+            continue
+        rel = p.relative_to(out)
+        if platform == "illumina":
+            keep = len(rel.parts) == 1 and p.suffix == ".txt" and (
+                p.name == "sample-ref.microDNA-JT.txt" or
+                p.name.startswith(("sample-ref.split.", "sample-ref.split_", "sample-ref.disc.")))
+            dest = ev / rel
+        else:
+            keep = rel.as_posix() in {
+                "eccDNA_final.txt", "no_candidates.json", "cresil_run/subGraphs.summary.txt"}
+            keep = keep or (len(rel.parts) == 4 and rel.parts[:2] == ("cresil_run", "assemGraph")
+                            and p.name in {"final_reads.fa", "reference_regions.fa"})
+            dest = ev / "cresil" / rel
+        if keep:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dest)
+            selected.append({"path": rel.as_posix(), "bytes": p.stat().st_size})
+        else:
+            omitted_bytes += p.stat().st_size
+    trim_rows = 0
+    if platform == "nanopore":
+        dest = ev / "cresil" / "trim.support.txt"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with (out / "trim.txt").open() as source, dest.open("w", newline="") as target:
+            reader = csv.DictReader(source, delimiter="\t")
+            if "readid" not in (reader.fieldnames or []):
+                raise ValueError("CReSIL trim schema mismatch")
+            writer = csv.DictWriter(target, fieldnames=reader.fieldnames, delimiter="\t", lineterminator="\n")
+            writer.writeheader()
+            for row in reader:
+                if row["readid"] in wanted:
+                    writer.writerow(row)
+                    trim_rows += 1
+    write_json(ev / "caller-retention.json", {"copied_files": selected,
+        "caller_bytes_not_copied_verbatim": omitted_bytes, "support_trim_rows": trim_rows,
+        "policy": "split/discordant tables and final calls; CReSIL graph sequences/tables and support-only trim rows"})
+
+
 def evidence(x):
     ev = x.work / "evidence"
     if ev.exists():
@@ -215,8 +261,6 @@ def evidence(x):
             sam.unlink()
         (ev / "read_ids.txt").write_text("".join(n+"\n" for n in sorted(wanted)))
         x.run(["samtools", "view", "-b", "-N", ev/"read_ids.txt", "-o", ev/"support.bam", x.out/"sample-ref.sorted.bam"])
-        for p in x.out.glob("*.txt"):
-            shutil.copy2(p, ev / p.name)
     else:
         for p in x.out.glob("cresil_run/assemGraph/*/final_reads.fa"):
             with p.open() as handle:
@@ -226,14 +270,7 @@ def evidence(x):
                         header = line[1:].split()[0]
                         wanted.add(header.split("_",1)[1].rsplit("_",2)[0])
         (ev / "read_ids.txt").write_text("".join(n+"\n" for n in sorted(wanted)))
-        # Retain graph/reference sequences, read fragments and tables. Exclude giant depth BAM/cache only.
-        for p in x.out.rglob("*"):
-            if p.is_symlink():
-                raise ValueError("Unexpected symlink in CReSIL output")
-            if p.is_file() and p.suffix not in (".bam", ".bai", ".mmi"):
-                dest = ev / "cresil" / p.relative_to(x.out)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(p, dest)
+    copy_caller_evidence(x.out, ev, x.s["platform"], wanted)
     counts = extract(x.inputs, wanted, ev, x.s["platform"])
     if x.s["platform"] == "nanopore":
         # Preserve original read alignments with CIGAR/SA/secondary records for downstream review.

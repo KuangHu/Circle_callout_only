@@ -1,6 +1,7 @@
 """Separate commands for DTN download and Slurm submission; no remote SSH calls."""
 import argparse
 import csv
+import getpass
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,11 @@ import time
 
 from .common import (GB, REPO, digest, fingerprint, load_config, lock, read_json,
                      safe_id, set_status, state_paths, tree_size, validate_sample, write_json, workflow_fingerprint)
+
+ACTIVE_JOBS = {"SUBMITTING", "QUEUED", "RUNNING"}
+HELD = {"DOWNLOAD_FAILED", "COMPUTE_FAILED", "CLEANUP_FAILED"}
+TERMINAL_JOBS = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
+                 "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}
 
 
 def entries(c):
@@ -65,7 +71,9 @@ def check_snapshot(c):
 def admitted(c, sample):
     active = [p for p in entries(c) if status(p) not in ("NEW", "CLEANED")]
     reserved = sum(read_json(p / "spec.json")["sample"]["peak_gb"] for p in active)
-    if len(active) >= c["max_active_samples"] or reserved + sample["peak_gb"] > c["scratch_budget_gb"]:
+    # Held samples retain their full disk reservation, but do not monopolize slots.
+    live = [p for p in active if status(p) not in HELD]
+    if len(live) >= c["max_active_samples"] or reserved + sample["peak_gb"] > c["scratch_budget_gb"]:
         return False
     # Account for remaining reserved expansion, not just currently free bytes.
     used = tree_size(c["scratch_dir"]) / GB
@@ -151,12 +159,69 @@ def validate_slurm(c):
         value = c["slurm"][key]
         if not value or "CHANGE_ME" in value or any(x.isspace() for x in value):
             raise ValueError(f"Set Slurm {key}")
+    setup = c["slurm"].get("setup_commands", [])
+    if not isinstance(setup, list) or any(not isinstance(line, str) or "\n" in line or "\r" in line for line in setup):
+        raise ValueError("slurm.setup_commands must be a list of single-line shell commands")
+
+
+def reconcile_jobs(c):
+    """Called under the submit lock; release slots only on confirmed scheduler exit.
+
+    Never retry jobs or remove worker locks. An unknown submission/accounting state
+    remains active so that an accounting outage cannot create duplicate work.
+    """
+    jobs = {}
+    for state in entries(c):
+        if status(state) in ACTIVE_JOBS and (state / "job.json").is_file():
+            jid = read_json(state / "job.json")["job_id"]
+            if not isinstance(jid, str) or not jid.isdigit():
+                raise ValueError(f"Invalid recorded job ID: {state.name}")
+            jobs[jid] = state
+    if not jobs:
+        return
+    try:
+        result = subprocess.run(["sacct", "-X", "-n", "-P", "-j", ",".join(jobs),
+                                 "--format=JobIDRaw,State%40"],
+                                check=True, capture_output=True, text=True, timeout=30)
+        terminal = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("|")
+            if len(fields) >= 2 and fields[1].strip():
+                terminal[fields[0].strip()] = fields[1].split()[0].rstrip("+")
+        # A requeued/preempted job may still be live despite an earlier terminal
+        # accounting record. Absence from the queue is required as well.
+        queue = subprocess.run(["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
+                               check=True, capture_output=True, text=True, timeout=30)
+        live = set(queue.stdout.split())
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Scheduler reconciliation unavailable; retaining job slots: {error}", file=sys.stderr, flush=True)
+        return
+    for jid, state in jobs.items():
+        if terminal.get(jid) in TERMINAL_JOBS and jid not in live and status(state) in ACTIVE_JOBS:
+            set_status(state, "COMPUTE_FAILED", job_id=jid, scheduler_state=terminal[jid],
+                       error="Job ended without worker final status; inspect retained scratch/locks before recovery")
+            print(f"Held {state.name}: Slurm {terminal[jid]}; job slot released, scratch retained", flush=True)
+
+
+def cleanup_archived(c):
+    """Isolate cleanup failures so a single sample cannot terminate the watcher."""
+    for state in entries(c):
+        if status(state) != "ARCHIVED" or any((state / name).exists() for name in (".worker-lock", ".cleanup-lock")):
+            continue
+        try:
+            cleanup(c, state.name)
+        except Exception as error:
+            # A concurrent explicit cleanup may have acquired its per-sample lock.
+            if status(state) == "ARCHIVED" and not (state / ".cleanup-lock").exists():
+                set_status(state, "CLEANUP_FAILED", error=str(error))
+            print(f"Cleanup held for {state.name}: {error}; continuing other samples", file=sys.stderr, flush=True)
 
 
 def submit_one(c, through="archive", sid=None):
     validate_slurm(c)
     with lock(Path(c["state_dir"]) / ".submit-lock"):
-        active = [p for p in entries(c) if status(p) in ("SUBMITTING", "QUEUED", "RUNNING")]
+        reconcile_jobs(c)
+        active = [p for p in entries(c) if status(p) in ACTIVE_JOBS]
         if len(active) >= c["max_jobs"]:
             return False
         for state in entries(c):
@@ -167,7 +232,8 @@ def submit_one(c, through="archive", sid=None):
             spec = read_json(state / "spec.json")
             script = state / "job.sh"
             cmd = [spec["python"], str(REPO / "stream.py"), "worker", "--spec", str(state / "spec.json"), "--through", through]
-            script.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexec " + shlex.join(cmd) + "\n", encoding="utf-8", newline="\n")
+            setup = "\n".join(c["slurm"].get("setup_commands", []))
+            script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + setup + "\nexec " + shlex.join(cmd) + "\n", encoding="utf-8", newline="\n")
             s = c["slurm"]
             name = "cs_" + fingerprint(str(state))[:16]
             set_status(state, "SUBMITTING", job_name=name)
@@ -231,7 +297,7 @@ def worker(spec_path, through):
     if not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("worker must run inside a Slurm allocation; unit tests do not invoke real callers")
     with lock(state / ".worker-lock"):
-        if status(state) not in ("SUBMITTING", "READY", "RETRY_READY"):
+        if status(state) not in ("SUBMITTING", "READY"):
             raise RuntimeError(f"Cannot start worker from {status(state)}")
         set_status(state, "RUNNING", job_id=os.environ["SLURM_JOB_ID"], started=time.time())
         work = scratch / "work"
@@ -281,7 +347,7 @@ def reconcile_archive(c, sid):
         if (state/".worker-lock").exists():
             raise ValueError("Worker lock present: confirm job completion before archive recovery")
         old = status(state)
-        if old not in ("ARCHIVED","CLEANED"):
+        if old not in ("ARCHIVED","CLEANED","CLEANUP_FAILED"):
             if not (state/"job.json").exists():
                 raise ValueError("No job ID available; reconcile ambiguous submission first")
             jid=read_json(state/"job.json")["job_id"]
@@ -430,11 +496,9 @@ def main():
         {"cleanup":cleanup,"recover":recover,"verify":reconcile_archive}[a.command](c, a.sample)
         return
     while True:
-        if a.command == "submit" and c["auto_cleanup"]:
-            for p in entries(c):
-                if status(p) == "ARCHIVED" and not (p / ".worker-lock").exists():
-                    cleanup(c, p.name)
         try:
+            if a.command == "submit" and c["auto_cleanup"]:
+                cleanup_archived(c)
             progressed = download_one(c,a.sample) if a.command == "download" else submit_one(c, a.through,a.sample)
         except Exception as error:
             if not a.watch:
@@ -445,4 +509,10 @@ def main():
             break
         if all(status(p) == "CLEANED" for p in entries(c)):
             break
+        if not progressed:
+            counts = {}
+            for p in entries(c):
+                key = status(p)
+                counts[key] = counts.get(key, 0) + 1
+            print(f"Waiting ({a.command}): {json.dumps(counts, sort_keys=True)}; held samples retain disk reservations", flush=True)
         time.sleep(1 if progressed else c["poll_seconds"])
