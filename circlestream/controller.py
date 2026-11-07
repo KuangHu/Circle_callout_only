@@ -14,7 +14,8 @@ import tarfile
 import time
 
 from .common import (GB, REPO, digest, fingerprint, load_config, lock, read_json,
-                     safe_id, set_status, state_paths, tree_size, validate_sample, write_json, workflow_fingerprint)
+                     local_mode, safe_id, set_status, source_ok, state_paths, tree_size, validate_sample, work_root,
+                     write_json, workflow_fingerprint)
 
 ACTIVE_JOBS = {"SUBMITTING", "QUEUED", "RUNNING"}
 HELD = {"DOWNLOAD_FAILED", "COMPUTE_FAILED", "CLEANUP_FAILED"}
@@ -49,6 +50,8 @@ def initialize(c, manifest):
             state, scratch = state_paths(c, sample["sample_id"])
             spec = {"config": c, "sample": sample, "repo": str(REPO), "python": sys.executable,
                     "workflow_sha256": workflow_fingerprint(), "reference_sha256": digest(sample["reference"])}
+            if c.get("reference_store"):
+                spec["reference_store_path"] = store_reference(c, sample["reference"], spec["reference_sha256"])
             if state.exists():
                 if read_json(state / "spec.json") != spec:
                     raise ValueError(f"Changed sample or software location: {state.name}; use a new ID/run root")
@@ -63,6 +66,25 @@ def initialize(c, manifest):
     print(f"Initialized {len(samples)} samples; no downloads or jobs started")
 
 
+def store_reference(c, path, sha):
+    """Permanent, deduplicated copy named by checksum; archives refer to it instead of embedding it."""
+    store = Path(c["reference_store"])
+    store.mkdir(parents=True, exist_ok=True)
+    dest = store / f"{sha}.fa"
+    if dest.exists():
+        if digest(dest) != sha:
+            raise ValueError(f"Reference store entry is corrupted: {dest}")
+        return str(dest)
+    temp = store / f".{sha}.{os.getpid()}.tmp"
+    shutil.copyfile(path, temp)
+    if digest(temp) != sha:
+        temp.unlink()
+        raise ValueError(f"Reference changed while copying into store: {path}")
+    os.chmod(temp, 0o444)
+    os.replace(temp, dest)
+    return str(dest)
+
+
 def check_snapshot(c):
     if read_json(Path(c["state_dir"]) / "config.json") != c:
         raise ValueError("Configuration differs from init snapshot; create a separate benchmark run")
@@ -73,6 +95,13 @@ def admitted(c, sample):
     reserved = sum(read_json(p / "spec.json")["sample"]["peak_gb"] for p in active)
     # Held samples retain their full disk reservation, but do not monopolize slots.
     live = [p for p in active if status(p) not in HELD]
+    if local_mode(c):
+        # Shared scratch only holds source objects; node-local disk holds the work.
+        raw = sum(f["size_bytes"] for p in active for f in read_json(p / "spec.json")["sample"]["files"])
+        need = sum(f["size_bytes"] for f in sample["files"])
+        if len(live) >= c["max_active_samples"] or (raw + need) / GB > c["scratch_budget_gb"]:
+            return False
+        return shutil.disk_usage(c["scratch_dir"]).free / GB >= need / GB + c["min_free_gb"]
     if len(live) >= c["max_active_samples"] or reserved + sample["peak_gb"] > c["scratch_budget_gb"]:
         return False
     # Account for remaining reserved expansion, not just currently free bytes.
@@ -85,7 +114,7 @@ def download_file(item, raw, retries):
     final = raw / item["name"]
     partial = raw / (item["name"] + ".part")
     def valid(path):
-        return path.is_file() and path.stat().st_size == item["size_bytes"] and digest(path, "md5") == item["md5"].lower()
+        return source_ok(path, item)
     if valid(final):
         return
     if final.exists():
@@ -118,7 +147,35 @@ def require_dtn(c):
         raise RuntimeError(f"Run download on configured DTN {c['download_host']}, not {socket.getfqdn()}")
 
 
+def claim_scratch(state, scratch, spec):
+    """Create owned scratch for an admitted NEW sample (caller holds the admission lock).
+    An existing directory is reused only if this exact spec owns it (download resume)."""
+    owner = {"spec_sha256": fingerprint(spec)}
+    if scratch.exists():
+        if read_json(scratch / ".owner.json") != owner:
+            raise ValueError(f"Unowned scratch directory already exists: {scratch}")
+    else:
+        scratch.mkdir()
+        write_json(scratch / ".owner.json", owner)
+    (scratch / "raw").mkdir(exist_ok=True)
+
+
+def fetch_inputs(c, sample, state, scratch):
+    """Download (or resume) source files into owned scratch and record timing."""
+    start = time.time()
+    for item in sample["files"]:
+        download_file(item, scratch / "raw", c["download_retries"])
+    write_json(state / "download.json", {
+        "seconds": time.time() - start,
+        "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
+        "host": socket.getfqdn(), "in_job": bool(os.environ.get("SLURM_JOB_ID")),
+        "files": sample["files"]
+    })
+
+
 def download_one(c, sid=None):
+    if local_mode(c):
+        raise RuntimeError("download_mode is 'slurm': 'submit --watch' launches 1-CPU fetch jobs; no DTN process")
     require_dtn(c)
     with lock(Path(c["state_dir"]) / ".download-lock"):
         for state in entries(c):
@@ -131,20 +188,10 @@ def download_one(c, sid=None):
             if not admitted(c, sample):
                 continue
             _, scratch = state_paths(c, sample["sample_id"])
-            scratch.mkdir(exist_ok=False)
-            write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
-            raw = scratch / "raw"
-            raw.mkdir()
+            claim_scratch(state, scratch, spec)
             set_status(state, "DOWNLOADING")
-            start = time.time()
             try:
-                for item in sample["files"]:
-                    download_file(item, raw, c["download_retries"])
-                write_json(state / "download.json", {
-                    "seconds": time.time() - start,
-                    "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
-                    "files": sample["files"]
-                })
+                fetch_inputs(c, sample, state, scratch)
                 set_status(state, "READY")
             except Exception as error:
                 set_status(state, "DOWNLOAD_FAILED", error=str(error))
@@ -152,6 +199,125 @@ def download_one(c, sid=None):
             print(f"Downloaded {sample['sample_id']}", flush=True)
             return True
     return False
+
+
+def fetch_records(c):
+    d = Path(c["state_dir"]) / ".fetch"
+    return sorted(d.glob("fetch-*.json")) if d.exists() else []
+
+
+def reconcile_fetch(c):
+    """Fetch jobs that ended leave no sample in DOWNLOADING (held, not retried)."""
+    records = fetch_records(c)
+    if not records:
+        return
+    ids = {read_json(r)["job_id"]: r for r in records}
+    try:
+        acct = subprocess.run(["sacct", "-X", "-n", "-P", "-j", ",".join(ids), "--format=JobIDRaw,State%40"],
+                              check=True, capture_output=True, text=True, timeout=30)
+        queue = subprocess.run(["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
+                               check=True, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Scheduler reconciliation unavailable; retaining fetch slots: {error}", file=sys.stderr, flush=True)
+        return
+    terminal = {}
+    for line in acct.stdout.splitlines():
+        f = line.split("|")
+        if len(f) >= 2 and f[1].strip():
+            terminal[f[0].strip()] = f[1].split()[0].rstrip("+")
+    live = set(queue.stdout.split())
+    for jid, record in ids.items():
+        if terminal.get(jid) not in TERMINAL_JOBS or jid in live:
+            continue
+        for sid in read_json(record)["samples"]:
+            state = Path(c["state_dir"]) / sid
+            if status(state) == "DOWNLOADING":
+                set_status(state, "DOWNLOAD_FAILED", fetch_job=jid, error=f"Fetch job ended ({terminal[jid]}) before this sample finished")
+                print(f"Held {sid}: fetch job {jid} {terminal[jid]}", flush=True)
+        os.replace(record, record.with_suffix(".done"))
+
+
+def submit_fetch(c):
+    """Launch one 1-CPU fetch job for a group of admitted NEW samples (slurm mode)."""
+    validate_slurm(c)
+    f, s = c["fetch"], c["slurm"]
+    with lock(Path(c["state_dir"]) / ".submit-lock"):
+        reconcile_fetch(c)
+        free_slots = f["max_jobs"] - len(fetch_records(c))
+        if free_slots <= 0:
+            return False
+        # Spread admissible samples over all free fetch slots (each fetch job downloads
+        # serially), so several fetch jobs feed processing concurrently.
+        states = entries(c)
+        live = sum(1 for p in states if status(p) not in ("NEW", "CLEANED") and status(p) not in HELD)
+        share = -(-max(0, c["max_active_samples"] - live) // free_slots)
+        cap = max(1, min(f.get("max_samples", 10), share))
+        chosen, size = [], 0
+        for state in states:
+            if status(state) != "NEW":
+                continue
+            spec = read_json(state / "spec.json")
+            need = sum(x["size_bytes"] for x in spec["sample"]["files"])
+            if len(chosen) >= cap or (chosen and size + need > f["batch_gb"] * GB):
+                break
+            if not admitted(c, spec["sample"]):
+                break
+            claim_scratch(state, state_paths(c, state.name)[1], spec)
+            set_status(state, "DOWNLOADING", fetch_job="pending")
+            chosen.append(state)
+            size += need
+        if not chosen:
+            return False
+        d = Path(c["state_dir"]) / ".fetch"
+        d.mkdir(exist_ok=True)
+        tag = f"fetch-{time.time_ns()}"
+        python = read_json(chosen[0] / "spec.json")["python"]
+        cmd = [python, str(REPO / "stream.py"), "fetch"] + [x for st in chosen for x in ("--spec", str(st / "spec.json"))]
+        script = d / f"{tag}.sh"
+        script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(s.get("setup_commands", [])) +
+                          "\nexec " + shlex.join(cmd) + "\n", encoding="utf-8", newline="\n")
+        result = subprocess.run([
+            "sbatch", "--parsable", "--account", s["account"], "--partition", s["partition"], "--qos", s["qos"],
+            "--cpus-per-task", "1", "--mem", f"{f['memory_gb']}G", "--time", f["time"],
+            "--job-name", "csf_" + fingerprint(tag)[:12], "--output", str(d / f"{tag}-%j.out"), str(script)
+        ], text=True, capture_output=True)
+        jobid = result.stdout.strip().split(";")[0]
+        if result.returncode != 0 or not jobid.isdigit():
+            for st in chosen:
+                set_status(st, "DOWNLOAD_FAILED", error=f"Fetch submission failed: {result.stderr.strip()[:300]}")
+            raise RuntimeError(f"Fetch job submission failed: {result.stderr.strip()}")
+        write_json(d / f"{tag}.json", {"job_id": jobid, "samples": [st.name for st in chosen],
+                                       "bytes": size, "submitted": time.time()})
+        for st in chosen:
+            if status(st) == "DOWNLOADING":
+                set_status(st, "DOWNLOADING", fetch_job=jobid)
+        print(f"Fetch job {jobid}: {len(chosen)} samples, {size/1e9:.2f} GB", flush=True)
+        return True
+
+
+def fetch_specs(spec_paths):
+    """Runs inside a 1-CPU fetch job: download each sample in turn; one failure holds only that sample."""
+    if not os.environ.get("SLURM_JOB_ID"):
+        raise RuntimeError("fetch must run inside a Slurm allocation")
+    failed = 0
+    for path in spec_paths:
+        spec = read_json(path)
+        c, sample = spec["config"], spec["sample"]
+        state, scratch = state_paths(c, sample["sample_id"])
+        if status(state) != "DOWNLOADING":
+            print(f"Skipping {state.name}: {status(state)}", flush=True)
+            continue
+        try:
+            if read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}:
+                raise ValueError("Scratch ownership mismatch")
+            fetch_inputs(c, sample, state, scratch)
+            set_status(state, "READY")
+            print(f"Fetched {state.name}", flush=True)
+        except Exception as error:
+            failed += 1
+            set_status(state, "DOWNLOAD_FAILED", error=str(error))
+            print(f"Held {state.name}: {error}", file=sys.stderr, flush=True)
+    return failed
 
 
 def validate_slurm(c):
@@ -267,7 +433,7 @@ def stage_local(c, sid, inputs):
         if len(inputs) != len(sample["files"]) or not admitted(c, sample):
             raise ValueError("Wrong input count or insufficient reserved capacity")
         for source,item in zip(inputs,sample["files"]):
-            if Path(source).stat().st_size != item["size_bytes"] or digest(source,"md5") != item["md5"].lower():
+            if not source_ok(source, item):
                 raise ValueError("Local input does not match manifest")
         scratch.mkdir(exist_ok=False)
         write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
@@ -278,7 +444,7 @@ def stage_local(c, sid, inputs):
             for source,item in zip(inputs,sample["files"]):
                 target=scratch / "raw" / item["name"]
                 shutil.copy2(source,target)
-                if digest(target,"md5") != item["md5"].lower():
+                if not source_ok(target, item):
                     raise ValueError("Staged input checksum mismatch")
             write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,
                 "compressed_bytes":sum(f["size_bytes"] for f in sample["files"])})
@@ -299,9 +465,13 @@ def worker(spec_path, through):
     with lock(state / ".worker-lock"):
         if status(state) not in ("SUBMITTING", "READY"):
             raise RuntimeError(f"Cannot start worker from {status(state)}")
-        set_status(state, "RUNNING", job_id=os.environ["SLURM_JOB_ID"], started=time.time())
-        work = scratch / "work"
-        work.mkdir(exist_ok=True)
+        set_status(state, "RUNNING", job_id=os.environ["SLURM_JOB_ID"], started=time.time(),
+                   host=socket.getfqdn())
+        root = work_root(c, sample["sample_id"])
+        if local_mode(c) and root.exists():
+            raise RuntimeError(f"Node-local work directory already exists: {root}")
+        work = root / "work"
+        work.mkdir(parents=True, exist_ok=True)
         target = {"preflight": "preflight.ok", "qc": "qc.ok", "reference": "reference.ok", "mapping": "mapping.ok",
                   "call": "call.ok", "evidence": "evidence.ok", "archive": "archive.ok"}[through]
         cmd = [spec["python"], "-m", "snakemake", "--snakefile", str(REPO / "workflow" / "Snakefile"),
@@ -313,6 +483,25 @@ def worker(spec_path, through):
         except Exception as error:
             set_status(state, "COMPUTE_FAILED", error=str(error))
             raise
+        finally:
+            if local_mode(c):
+                remove_local(root)
+    if local_mode(c) and through == "archive" and c["auto_cleanup"]:
+        # Verify the bundle and release the staged source object from inside the job.
+        # With auto_cleanup=false the staged copy stays until an explicit 'cleanup'.
+        try:
+            cleanup(c, sample["sample_id"])
+        except Exception as error:  # e.g. the login loop holds .cleanup-lock; it will finish
+            print(f"In-job cleanup deferred for {sample['sample_id']}: {error}", file=sys.stderr, flush=True)
+
+
+def remove_local(root):
+    """Delete this job's node-local tree; logs and metrics already live in the state dir."""
+    base = Path(os.environ.get("CS_LOCAL_ROOT", "/tmp")).resolve()
+    job = root.parent
+    if job.parent.resolve() != base or job.name != f"circle-stream-{os.environ.get('SLURM_JOB_ID')}" or job.is_symlink():
+        raise ValueError(f"Refusing to remove unexpected local path {job}")
+    shutil.rmtree(job, ignore_errors=True)
 
 
 def verify_bundle(state):
@@ -405,6 +594,10 @@ def recover(c, sid):
     for name in (".worker-lock", ".cleanup-lock"):
         if (state / name).exists():
             raise ValueError(f"Inspect stale lock first: {state / name}")
+    if current == "DOWNLOAD_FAILED" and local_mode(c):
+        # The next fetch job resumes into the same owned scratch (partial files are checksum-gated).
+        set_status(state, "NEW", recovered_from="DOWNLOAD_FAILED")
+        return
     if current in ("DOWNLOAD_FAILED", "DOWNLOADING"):
         require_dtn(c)
         if (Path(c["state_dir"]) / ".download-lock").exists():
@@ -457,18 +650,20 @@ def report(c):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command", choices=["init", "download", "stage-local", "submit", "cleanup", "verify", "recover", "status", "report", "worker"])
+    ap.add_argument("command", choices=["init", "download", "stage-local", "submit", "cleanup", "verify", "recover", "status", "report", "worker", "fetch"])
     ap.add_argument("--config", default="config.local.json")
     ap.add_argument("--manifest", default="samples.local.json")
     ap.add_argument("--sample")
-    ap.add_argument("--spec")
+    ap.add_argument("--spec", action="append")
     ap.add_argument("--inputs", nargs="+")
     ap.add_argument("--watch", action="store_true")
     ap.add_argument("--through", choices=["preflight", "qc", "reference", "mapping", "call", "evidence", "archive"], default="archive")
     a = ap.parse_args()
     if a.command == "worker":
-        worker(a.spec, a.through)
+        worker(a.spec[0], a.through)
         return
+    if a.command == "fetch":
+        sys.exit(1 if fetch_specs(a.spec) else 0)
     c = load_config(a.config)
     if a.command == "init":
         initialize(c, a.manifest)
@@ -499,7 +694,11 @@ def main():
         try:
             if a.command == "submit" and c["auto_cleanup"]:
                 cleanup_archived(c)
-            progressed = download_one(c,a.sample) if a.command == "download" else submit_one(c, a.through,a.sample)
+            if a.command == "download":
+                progressed = download_one(c, a.sample)
+            else:
+                fetched = submit_fetch(c) if local_mode(c) else False
+                progressed = submit_one(c, a.through, a.sample) or fetched
         except Exception as error:
             if not a.watch:
                 raise

@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,10 +9,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from circlestream.common import GB, REPO, digest, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
-from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm
+from circlestream.common import GB, REPO, S3_PART_SIZES, digest, s3_etag_matches, source_ok, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
+from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm, worker, submit_fetch, fetch_specs, reconcile_fetch, fetch_records
 from circlestream.fastq import extract, materialize
-from circlestream.rules import Context, archive, cf_lines, copy_caller_evidence
+from circlestream.rules import Context, archive, cf_lines, convert_sra, copy_caller_evidence
 from scripts.cresil_wgls_checked import execute, strict_call
 from types import SimpleNamespace
 
@@ -60,7 +61,7 @@ class PipelineTests(unittest.TestCase):
         ev=x.work/"evidence"
         ev.mkdir()
         (ev/"support.bam").write_bytes(b"mock-bam-for-control-plane-test")
-        shutil.copy2(self.ref,ev/"reference.fa")
+        write_json(ev/"reference.json",{"path":str(self.ref),"sha256":digest(self.ref)})
         write_json(self.state/"calls.json",{"candidate_count":0})
         write_json(self.state/"evidence.json",{"read_ids":0})
         archive(x)
@@ -449,7 +450,7 @@ class PipelineTests(unittest.TestCase):
                 x = Context(read_json(state / "spec.json"))
                 ev = x.work / "evidence"; ev.mkdir(parents=True)
                 (ev / "support.bam").write_bytes(b"fake-caller-product")
-                shutil.copy2(self.ref, ev / "reference.fa")
+                write_json(ev / "reference.json", {"path": str(self.ref), "sha256": digest(self.ref)})
                 write_json(state / "calls.json", {"candidate_count": 0})
                 write_json(state / "evidence.json", {"read_ids": 0})
                 archive(x)
@@ -460,6 +461,250 @@ class PipelineTests(unittest.TestCase):
                 verify_bundle(state)
             self.assertFalse(download_one(self.c))
             self.assertFalse(submit_one(self.c))
+
+
+    # ---- NCBI SRA on AWS source + in-job download ----
+    def sra_item(self, path):
+        data = path.read_bytes(); part = S3_PART_SIZES[0]
+        sums = b"".join(hashlib.md5(data[i:i+part]).digest() for i in range(0, len(data), part))
+        n = -(-len(data) // part)
+        return {"name": "SRR000001.sra", "url": "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR000001/SRR000001",
+                "size_bytes": len(data), "s3_etag": f"{hashlib.md5(sums).hexdigest()}-{n}"}
+
+    def test_s3_multipart_etag_verifies_and_detects_corruption(self):
+        obj = self.root / "SRR000001.sra"
+        obj.write_bytes(bytes(range(256)) * (S3_PART_SIZES[0] // 256 * 2 + 7))
+        item = self.sra_item(obj)
+        self.assertTrue(item["s3_etag"].endswith("-3"))
+        self.assertTrue(source_ok(obj, item))
+        data = bytearray(obj.read_bytes()); data[S3_PART_SIZES[0] + 5] ^= 1; obj.write_bytes(bytes(data))
+        self.assertFalse(source_ok(obj, item))
+        self.assertFalse(s3_etag_matches(obj, "not-an-etag"))
+
+    def test_sra_manifest_entries_validated(self):
+        obj = self.root / "SRR000001.sra"; obj.write_bytes(b"x" * 1000)
+        for platform in ("illumina", "nanopore"):
+            validate_sample(dict(self.s, platform=platform, files=[self.sra_item(obj)]))
+        bad = self.sra_item(obj); del bad["s3_etag"]
+        with self.assertRaises(ValueError): validate_sample(dict(self.s, files=[bad]))
+        with self.assertRaises(ValueError):
+            validate_sample(dict(self.s, platform="illumina", files=[self.sra_item(obj), dict(self.sra_item(obj), name="SRR000002.sra")]))
+
+    def slurm_mode(self, n=1):
+        c = dict(self.c, download_mode="slurm", auto_cleanup=True, fetch={"max_jobs": 1, "batch_gb": 1, "time": "01:00:00", "memory_gb": 1})
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = str(self.root / ("sl_" + key))
+        write_json(self.manifest, [dict(self.s, sample_id=f"t{i}") for i in range(n)])
+        initialize(c, self.manifest)
+        return c
+
+    def fake_sbatch(self, log, jid="555"):
+        def run(cmd, **kwargs):
+            if cmd[0] == "sbatch":
+                log.append(cmd); return subprocess.CompletedProcess(cmd, 0, jid + "\n", "")
+            if cmd[0] == "curl":
+                shutil.copyfile(self.raw, cmd[cmd.index("--output") + 1]); return subprocess.CompletedProcess(cmd, 0)
+            raise AssertionError(cmd)
+        return run
+
+    def test_slurm_mode_fetch_job_is_one_cpu_and_groups_samples(self):
+        c = self.slurm_mode(3)
+        log = []
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch(log)), \
+             patch("circlestream.controller.reconcile_fetch"):
+            with self.assertRaises(RuntimeError): download_one(c)
+            self.assertTrue(submit_fetch(c))
+            self.assertFalse(submit_fetch(c))  # fetch.max_jobs=1
+        cmd = log[0]
+        self.assertEqual(cmd[cmd.index("--cpus-per-task") + 1], "1")
+        rec = read_json(next((Path(c["state_dir"]) / ".fetch").glob("fetch-*.json")))
+        self.assertEqual(rec["samples"], ["t0", "t1"])  # max_active_samples=2
+        self.assertEqual([status(Path(c["state_dir"]) / f"t{i}") for i in range(3)], ["DOWNLOADING", "DOWNLOADING", "NEW"])
+
+    def test_slurm_mode_fetch_downloads_then_process_job_submitted(self):
+        c = self.slurm_mode(1)
+        state = Path(c["state_dir"]) / "t0"
+        log = []
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch(log)), \
+             patch("circlestream.controller.reconcile_fetch"), patch("circlestream.controller.reconcile_jobs"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                self.assertEqual(fetch_specs([state / "spec.json"]), 0)
+            self.assertEqual(status(state), "READY")
+            self.assertTrue(read_json(state / "download.json")["in_job"])
+            self.assertTrue(submit_one(c))
+        self.assertEqual(log[-1][log[-1].index("--cpus-per-task") + 1], str(c["slurm"]["cpus"]))
+
+    def test_slurm_mode_ended_fetch_job_holds_unfinished_samples(self):
+        c = self.slurm_mode(1)
+        state = Path(c["state_dir"]) / "t0"
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            submit_fetch(c)
+        def sched(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 0, "555|TIMEOUT\n" if cmd[0] == "sacct" else "", "")
+        with patch("circlestream.controller.subprocess.run", side_effect=sched):
+            reconcile_fetch(c)
+        self.assertEqual(status(state), "DOWNLOAD_FAILED")
+        self.assertEqual(fetch_records(c), [])
+        recover(c, "t0")
+        self.assertEqual(status(state), "NEW")  # next fetch job resumes into the same owned scratch
+
+    def test_slurm_mode_admission_uses_source_bytes_without_tree_walk(self):
+        c = self.slurm_mode(1)
+        c["scratch_budget_gb"] = self.raw.stat().st_size / GB / 2
+        with patch("circlestream.controller.tree_size", side_effect=AssertionError("Lustre walk")):
+            self.assertFalse(admitted(c, self.s))
+            c["scratch_budget_gb"] = 1
+            self.assertTrue(admitted(c, self.s))
+
+    def test_slurm_mode_worker_uses_local_disk_and_cleans_up(self):
+        c = self.slurm_mode(1)
+        state = Path(c["state_dir"]) / "t0"; scratch = Path(c["scratch_dir"]) / "t0"
+        local = self.root / "nodetmp"; local.mkdir()
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"), patch("circlestream.controller.reconcile_jobs"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                fetch_specs([state / "spec.json"])
+            submit_one(c)
+        seen = {}
+        def fake_snakemake(cmd, **kw):
+            x = Context(read_json(state / "spec.json"))
+            seen["work"] = x.work
+            self.assertTrue(str(x.work).startswith(str(local / "circle-stream-777")))
+            ev = x.work / "evidence"; ev.mkdir(parents=True)
+            (ev / "support.bam").write_bytes(b"fake"); write_json(ev / "reference.json", {"path": str(self.ref), "sha256": digest(self.ref)})
+            write_json(state / "calls.json", {"candidate_count": 0}); write_json(state / "evidence.json", {"read_ids": 0})
+            archive(x)
+            return subprocess.CompletedProcess(cmd, 0)
+        with patch.dict("os.environ", {"SLURM_JOB_ID": "777", "CS_LOCAL_ROOT": str(local)}), \
+             patch("circlestream.controller.subprocess.run", side_effect=fake_snakemake):
+            worker(state / "spec.json", "archive")
+        self.assertEqual(status(state), "CLEANED")
+        self.assertFalse(scratch.exists())
+        self.assertFalse((local / "circle-stream-777").exists())
+        verify_bundle(state)
+
+    def test_slurm_mode_failed_worker_still_removes_local_disk(self):
+        c = self.slurm_mode(1)
+        state = Path(c["state_dir"]) / "t0"
+        local = self.root / "nodetmp"; local.mkdir()
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"), patch("circlestream.controller.reconcile_jobs"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                fetch_specs([state / "spec.json"])
+            submit_one(c)
+        with patch.dict("os.environ", {"SLURM_JOB_ID": "778", "CS_LOCAL_ROOT": str(local)}), \
+             patch("circlestream.controller.subprocess.run", side_effect=subprocess.CalledProcessError(1, "snakemake")):
+            with self.assertRaises(subprocess.CalledProcessError): worker(state / "spec.json", "archive")
+        self.assertEqual(status(state), "COMPUTE_FAILED")
+        self.assertFalse((local / "circle-stream-778").exists())
+        self.assertTrue((Path(c["scratch_dir"]) / "t0" / "raw" / "reads.fastq.gz").is_file())  # source kept for recovery
+
+    def test_slurm_mode_auto_cleanup_false_keeps_staged_source(self):
+        c = self.slurm_mode(1); c["auto_cleanup"] = False
+        # config snapshot must match: re-init a separate run root with the flag off
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = c[key] + "_keep"
+        initialize(c, self.manifest)
+        state = Path(c["state_dir"]) / "t0"; scratch = Path(c["scratch_dir"]) / "t0"
+        local = self.root / "nodetmp"; local.mkdir()
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"), patch("circlestream.controller.reconcile_jobs"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                fetch_specs([state / "spec.json"])
+            submit_one(c)
+        def fake_snakemake(cmd, **kw):
+            x = Context(read_json(state / "spec.json"))
+            ev = x.work / "evidence"; ev.mkdir(parents=True)
+            (ev / "support.bam").write_bytes(b"fake")
+            write_json(ev / "reference.json", {"path": str(self.ref), "sha256": digest(self.ref)})
+            write_json(state / "calls.json", {"candidate_count": 0}); write_json(state / "evidence.json", {"read_ids": 0})
+            archive(x)
+            return subprocess.CompletedProcess(cmd, 0)
+        with patch.dict("os.environ", {"SLURM_JOB_ID": "779", "CS_LOCAL_ROOT": str(local)}), \
+             patch("circlestream.controller.subprocess.run", side_effect=fake_snakemake):
+            worker(state / "spec.json", "archive")
+        self.assertEqual(status(state), "ARCHIVED")
+        self.assertTrue((scratch / "raw" / "reads.fastq.gz").is_file())
+        self.assertFalse((local / "circle-stream-779").exists())  # node-local work is always removed
+
+    def test_slurm_mode_fetch_groups_are_balanced_and_capped(self):
+        c = self.slurm_mode(6)
+        c.update(max_active_samples=6, fetch=dict(c["fetch"], max_jobs=3, batch_gb=100))
+        records = []
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            while submit_fetch(c):
+                pass
+        sizes = [len(read_json(r)["samples"]) for r in fetch_records(c)]
+        self.assertEqual(sizes, [2, 2, 2])  # 6 admissible over 3 free slots, not 6 in one job
+        c2 = self.slurm_mode(5)
+        c2.update(max_active_samples=5, fetch=dict(c2["fetch"], max_jobs=1, batch_gb=100, max_samples=3))
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c2[key] = c2[key] + "_cap"
+        initialize(c2, self.manifest)
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            submit_fetch(c2)
+        self.assertEqual(len(read_json(fetch_records(c2)[0])["samples"]), 3)
+
+    def test_reference_store_is_deduplicated_read_only_and_checked(self):
+        c = dict(self.c, reference_store=str(self.root / "refstore"))
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = str(self.root / ("rs_" + key))
+        write_json(self.manifest, [dict(self.s, sample_id="r1"), dict(self.s, sample_id="r2")])
+        initialize(c, self.manifest)
+        sha = digest(self.ref)
+        stored = Path(c["reference_store"]) / f"{sha}.fa"
+        self.assertEqual(sorted(p.name for p in stored.parent.iterdir()), [stored.name])
+        self.assertEqual(digest(stored), sha)
+        self.assertFalse(stored.stat().st_mode & 0o222)
+        self.assertEqual(read_json(Path(c["state_dir"]) / "r1" / "spec.json")["reference_store_path"], str(stored))
+        os.chmod(stored, 0o644); stored.write_text(">bad\nA\n")
+        write_json(self.manifest, [dict(self.s, sample_id="r3")])
+        with self.assertRaises(ValueError): initialize(c, self.manifest)
+
+    def sra_context(self, platform):
+        obj = self.root / "SRR000001.sra"; obj.write_bytes(b"sra")
+        x = SimpleNamespace(s={"platform": platform}, cpus=4, state=self.root / "st", scratch=self.root / "sc")
+        x.state.mkdir(exist_ok=True); (x.scratch / "raw").mkdir(parents=True, exist_ok=True)
+        x.raw_files = [obj]
+        fqd = x.scratch / "raw" / "fastq"
+        x.inputs = [fqd / "SRR000001_1.fastq", fqd / "SRR000001_2.fastq"] if platform == "illumina" else [fqd / "SRR000001.fastq"]
+        return x
+
+    def fake_fqd(self, names):
+        def run(cmd, **kwargs):
+            out = Path(cmd[cmd.index("-O") + 1])
+            for n in names:
+                fq(out / n)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return run
+
+    def test_convert_sra_illumina_drops_orphans_and_records(self):
+        x = self.sra_context("illumina")
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq", "SRR000001.fastq"])):
+            info = convert_sra(x)
+        self.assertEqual(info["dropped_unpaired_files"], ["SRR000001.fastq"])
+        self.assertTrue(all(p.is_file() for p in x.inputs))
+        self.assertFalse((x.scratch / "raw" / "fastq" / "SRR000001.fastq").exists())
+        with patch("circlestream.rules.subprocess.run") as run:
+            convert_sra(x); run.assert_not_called()  # completed conversion is reused
+
+    def test_convert_sra_layout_mismatch_fails(self):
+        x = self.sra_context("illumina")
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001.fastq"])):
+            with self.assertRaises(ValueError): convert_sra(x)
+        x = self.sra_context("nanopore")
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq"])):
+            with self.assertRaises(ValueError): convert_sra(x)
 
 
 if __name__=="__main__": unittest.main()
