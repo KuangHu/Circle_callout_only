@@ -14,7 +14,7 @@ import tarfile
 import time
 
 from .common import (GB, REPO, digest, fingerprint, load_config, lock, read_json,
-                     safe_id, set_status, state_paths, tree_size, validate_sample, write_json, workflow_fingerprint)
+                     safe_id, set_status, source_ok, state_paths, tree_size, validate_sample, write_json, workflow_fingerprint)
 
 ACTIVE_JOBS = {"SUBMITTING", "QUEUED", "RUNNING"}
 HELD = {"DOWNLOAD_FAILED", "COMPUTE_FAILED", "CLEANUP_FAILED"}
@@ -85,7 +85,7 @@ def download_file(item, raw, retries):
     final = raw / item["name"]
     partial = raw / (item["name"] + ".part")
     def valid(path):
-        return path.is_file() and path.stat().st_size == item["size_bytes"] and digest(path, "md5") == item["md5"].lower()
+        return source_ok(path, item)
     if valid(final):
         return
     if final.exists():
@@ -118,7 +118,29 @@ def require_dtn(c):
         raise RuntimeError(f"Run download on configured DTN {c['download_host']}, not {socket.getfqdn()}")
 
 
+def claim_scratch(state, scratch, spec):
+    """Create owned scratch for an admitted NEW sample (caller holds the admission lock)."""
+    scratch.mkdir(exist_ok=False)
+    write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
+    (scratch / "raw").mkdir()
+
+
+def fetch_inputs(c, sample, state, scratch):
+    """Download (or resume) source files into owned scratch and record timing."""
+    start = time.time()
+    for item in sample["files"]:
+        download_file(item, scratch / "raw", c["download_retries"])
+    write_json(state / "download.json", {
+        "seconds": time.time() - start,
+        "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
+        "host": socket.getfqdn(), "in_job": bool(os.environ.get("SLURM_JOB_ID")),
+        "files": sample["files"]
+    })
+
+
 def download_one(c, sid=None):
+    if c.get("download_mode", "dtn") == "job":
+        raise RuntimeError("download_mode is 'job': inputs are fetched inside each Slurm job; run only 'submit --watch'")
     require_dtn(c)
     with lock(Path(c["state_dir"]) / ".download-lock"):
         for state in entries(c):
@@ -131,20 +153,10 @@ def download_one(c, sid=None):
             if not admitted(c, sample):
                 continue
             _, scratch = state_paths(c, sample["sample_id"])
-            scratch.mkdir(exist_ok=False)
-            write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
-            raw = scratch / "raw"
-            raw.mkdir()
+            claim_scratch(state, scratch, spec)
             set_status(state, "DOWNLOADING")
-            start = time.time()
             try:
-                for item in sample["files"]:
-                    download_file(item, raw, c["download_retries"])
-                write_json(state / "download.json", {
-                    "seconds": time.time() - start,
-                    "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
-                    "files": sample["files"]
-                })
+                fetch_inputs(c, sample, state, scratch)
                 set_status(state, "READY")
             except Exception as error:
                 set_status(state, "DOWNLOAD_FAILED", error=str(error))
@@ -224,12 +236,19 @@ def submit_one(c, through="archive", sid=None):
         active = [p for p in entries(c) if status(p) in ACTIVE_JOBS]
         if len(active) >= c["max_jobs"]:
             return False
+        in_job = c.get("download_mode", "dtn") == "job"
         for state in entries(c):
             if sid and state.name != sid:
                 continue
-            if status(state) != "READY":
+            current = status(state)
+            if current != "READY" and not (in_job and current == "NEW"):
                 continue
             spec = read_json(state / "spec.json")
+            if current == "NEW":
+                # In-job download: the submitter is the only admitter, under the submit lock.
+                if not admitted(c, spec["sample"]):
+                    continue
+                claim_scratch(state, state_paths(c, state.name)[1], spec)
             script = state / "job.sh"
             cmd = [spec["python"], str(REPO / "stream.py"), "worker", "--spec", str(state / "spec.json"), "--through", through]
             setup = "\n".join(c["slurm"].get("setup_commands", []))
@@ -267,7 +286,7 @@ def stage_local(c, sid, inputs):
         if len(inputs) != len(sample["files"]) or not admitted(c, sample):
             raise ValueError("Wrong input count or insufficient reserved capacity")
         for source,item in zip(inputs,sample["files"]):
-            if Path(source).stat().st_size != item["size_bytes"] or digest(source,"md5") != item["md5"].lower():
+            if not source_ok(source, item):
                 raise ValueError("Local input does not match manifest")
         scratch.mkdir(exist_ok=False)
         write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(spec)})
@@ -278,7 +297,7 @@ def stage_local(c, sid, inputs):
             for source,item in zip(inputs,sample["files"]):
                 target=scratch / "raw" / item["name"]
                 shutil.copy2(source,target)
-                if digest(target,"md5") != item["md5"].lower():
+                if not source_ok(target, item):
                     raise ValueError("Staged input checksum mismatch")
             write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,
                 "compressed_bytes":sum(f["size_bytes"] for f in sample["files"])})
@@ -300,6 +319,12 @@ def worker(spec_path, through):
         if status(state) not in ("SUBMITTING", "READY"):
             raise RuntimeError(f"Cannot start worker from {status(state)}")
         set_status(state, "RUNNING", job_id=os.environ["SLURM_JOB_ID"], started=time.time())
+        if c.get("download_mode", "dtn") == "job":
+            try:
+                fetch_inputs(c, sample, state, scratch)
+            except Exception as error:
+                set_status(state, "COMPUTE_FAILED", error=f"In-job download failed: {error}")
+                raise
         work = scratch / "work"
         work.mkdir(exist_ok=True)
         target = {"preflight": "preflight.ok", "qc": "qc.ok", "reference": "reference.ok", "mapping": "mapping.ok",

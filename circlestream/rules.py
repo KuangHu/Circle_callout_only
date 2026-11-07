@@ -11,9 +11,10 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
-from .common import GB, REPO, digest, fingerprint, read_json, state_paths, write_json
+from .common import GB, REPO, digest, fingerprint, is_sra, read_json, source_ok, state_paths, write_json
 from .fastq import extract, materialize
 
 CF_SHA256 = "a7df874bb976cd8761840f91190df43ac3dc949b7e97796441b86b0bb699acd2"
@@ -26,7 +27,16 @@ class Context:
         self.c, self.s = spec["config"], spec["sample"]
         self.state, self.scratch = state_paths(self.c, self.s["sample_id"])
         self.work = self.scratch / "work"
-        self.inputs = [self.scratch / "raw" / f["name"] for f in self.s["files"]]
+        self.raw_files = [self.scratch / "raw" / f["name"] for f in self.s["files"]]
+        self.sra = any(is_sra(f) for f in self.s["files"])
+        if self.sra:
+            # FASTQ converted from the SRA object during qc (fasterq-dump --split-3 naming).
+            run = self.raw_files[0].stem
+            fq_dir = self.scratch / "raw" / "fastq"
+            self.inputs = ([fq_dir / f"{run}_1.fastq", fq_dir / f"{run}_2.fastq"]
+                           if self.s["platform"] == "illumina" else [fq_dir / f"{run}.fastq"])
+        else:
+            self.inputs = self.raw_files
         self.prefix = self.c["tools"][self.s["platform"] + "_prefix"]
         self.cpus = self.c["slurm"]["cpus"]
         self.ref = self.work / "reference" / "genome.fa"
@@ -61,9 +71,15 @@ def preflight(x):
     for p in (x.work, x.state, Path(x.s["reference"])):
         if not re.fullmatch(r"[A-Za-z0-9_./-]+", str(p)):
             raise ValueError(f"Caller paths must not contain spaces/shell metacharacters: {p}")
-    for path, item in zip(x.inputs, x.s["files"]):
-        if path.stat().st_size != item["size_bytes"] or digest(path, "md5") != item["md5"].lower():
+    for path, item in zip(x.raw_files, x.s["files"]):
+        if not source_ok(path, item):
             raise ValueError(f"Input checksum mismatch: {path}")
+    if x.sra:
+        # Internal per-column MD5s of the SRA object, in addition to the S3 transfer checksum.
+        result = subprocess.run([sra_tool("vdb-validate"), str(x.raw_files[0])], capture_output=True, text=True)
+        (x.state / "vdb-validate.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+        if result.returncode != 0 or "is consistent" not in result.stdout + result.stderr:
+            raise ValueError(f"vdb-validate failed for {x.raw_files[0]}")
     binaries = ["samtools", "bedtools", "bash"]
     binaries += ["bwa", "samblaster", "awk", "grep", "sed", "sort"] if x.s["platform"] == "illumina" else ["cresil", "minimap2", "mosdepth"]
     x.shell("command -v " + " ".join(binaries))
@@ -89,9 +105,52 @@ def preflight(x):
     })
 
 
+def sra_tool(name):
+    """sra-tools live in the control environment next to the worker's Python."""
+    path = Path(sys.executable).parent / name
+    if not path.is_file():
+        raise FileNotFoundError(f"{name} not found beside {sys.executable}; install sra-tools in the control env")
+    return str(path)
+
+
+def convert_sra(x):
+    """fasterq-dump into raw/fastq; random-access temp files go to node-local disk."""
+    out = x.scratch / "raw" / "fastq"
+    if all(p.is_file() for p in x.inputs) and (out / ".complete").is_file():
+        return read_json(out / ".complete")
+    if out.exists():
+        shutil.rmtree(out)  # partial conversion from an interrupted job; source object is retained
+    out.mkdir()
+    local = os.environ.get("TMPDIR") if os.environ.get("TMPDIR", "").startswith("/tmp") else "/tmp"
+    start = time.time()
+    with tempfile.TemporaryDirectory(prefix="cs-fqd-", dir=local) as tmp:
+        result = subprocess.run([sra_tool("fasterq-dump"), "--split-3", "--skip-technical", "-e", str(x.cpus),
+                                 "-t", tmp, "-O", str(out), str(x.raw_files[0])], capture_output=True, text=True)
+    (x.state / "fasterq-dump.log").write_text(result.stdout + result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        raise RuntimeError(f"fasterq-dump failed ({result.returncode}); see fasterq-dump.log")
+    produced = sorted(p.name for p in out.glob("*.fastq"))
+    expected = sorted(p.name for p in x.inputs)
+    orphans = [n for n in produced if n not in expected]
+    if [n for n in expected if n not in produced]:
+        raise ValueError(f"SRA layout does not match platform {x.s['platform']}: produced {produced}, expected {expected}")
+    if x.s["platform"] == "nanopore" and orphans:
+        raise ValueError(f"Unexpected extra reads from ONT SRA object: {orphans}")
+    # Illumina --split-3 puts mate-less reads in <run>.fastq; record and drop them (pairs only).
+    info = {"seconds": time.time() - start, "tool": "fasterq-dump --split-3 --skip-technical",
+            "outputs": {n: (out / n).stat().st_size for n in produced}, "dropped_unpaired_files": orphans}
+    for n in orphans:
+        (out / n).unlink()
+    write_json(out / ".complete", info)
+    return info
+
+
 def qc(x):
+    conversion = convert_sra(x) if x.sra else None
     stats = materialize(x.inputs, x.work / "prepared", x.s["platform"],
                         x.c["caller"].get("short_read_policy", "reject"))
+    if conversion:
+        stats["sra_conversion"] = conversion
     write_json(x.state / "qc.json", stats)
 
 

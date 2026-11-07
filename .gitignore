@@ -9,3 +9,6 @@ vendor/
 *.zip
 config.*.json
 !config.example.json
+samples.*.json
+!samples.example.json
+runs.*.tsv

@@ -8,6 +8,7 @@
   "max_jobs": 2,
   "download_host": "lrc-xfer.lbl.gov",
   "download_retries": 3,
+  "download_mode": "dtn",
   "poll_seconds": 60,
   "auto_cleanup": false,
   "slurm": {

@@ -17,6 +17,8 @@
 - 必须显式提供未压缩 reference。v0.1 **不自动组装、不选择参考、不发现参考外序列**。含 IS 的 reference 可以来自独立样本组装，不需要 insertion catalog。
 - RCA/enriched/ATAC、PacBio、单端 Illumina、低于 75 bp 的普通 WGS 不混入本配置。
 - 已做 adapter trimming 的 Illumina：默认 `caller.short_read_policy="reject"` 拒绝含 <75 bp reads 的样本；设为 `"drop_pair"` 时任一 mate <75 bp 则整对丢弃，其余 reads 保持原长度，`qc.json` 记录总/丢弃/保留 pairs 和保留碱基。FASTQ 截断、配对 ID、质量长度等错误仍然报错。过滤会去掉部分短片段信号，结果需注明该策略。
+- 数据源：ENA HTTPS 在 LRC 实测每连接约 0.7–2.5 MB/s 且整体被限速；NCBI SRA 的 AWS 公开桶（`https://sra-pub-run-odp.s3.amazonaws.com/sra/<run>/<run>`）实测单连接 12–18 MB/s、8 连接 41–55 MB/s。manifest 中可用 `<run>.sra` 单文件条目（`size_bytes` + `s3_etag`，由 `scripts/sra_manifest.py` 通过 HEAD 生成）；下载后校验 S3 multipart ETag，preflight 再跑 `vdb-validate`，qc 用 `fasterq-dump --split-3`（临时文件在节点本地 /tmp）转 FASTQ，Illumina 无配对的 reads 丢弃并记录。需要在 control env 安装 `sra-tools`。
+- `download_mode`：`"dtn"`（默认，DTN 上 `download --watch` + 登录节点 `submit --watch`）或 `"job"`（只运行 `submit --watch`；提交器按磁盘预留直接接纳 NEW 样本，在 Slurm 作业内先下载再跑流程，不需要 DTN 进程，也不需要整节点）。
 - 检出的对象是 **circularization-compatible candidates**。tandem duplication 等结构可能有同样 junction；caller 输出不是物理闭环证明。
 
 ## 架构

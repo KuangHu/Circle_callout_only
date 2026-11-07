@@ -8,10 +8,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from circlestream.common import GB, REPO, digest, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
-from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm
+from circlestream.common import GB, REPO, S3_PART_SIZES, digest, s3_etag_matches, source_ok, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
+from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm, worker
 from circlestream.fastq import extract, materialize
-from circlestream.rules import Context, archive, cf_lines, copy_caller_evidence
+from circlestream.rules import Context, archive, cf_lines, convert_sra, copy_caller_evidence
 from scripts.cresil_wgls_checked import execute, strict_call
 from types import SimpleNamespace
 
@@ -460,6 +460,121 @@ class PipelineTests(unittest.TestCase):
                 verify_bundle(state)
             self.assertFalse(download_one(self.c))
             self.assertFalse(submit_one(self.c))
+
+
+    # ---- NCBI SRA on AWS source + in-job download ----
+    def sra_item(self, path):
+        data = path.read_bytes(); part = S3_PART_SIZES[0]
+        sums = b"".join(hashlib.md5(data[i:i+part]).digest() for i in range(0, len(data), part))
+        n = -(-len(data) // part)
+        return {"name": "SRR000001.sra", "url": "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR000001/SRR000001",
+                "size_bytes": len(data), "s3_etag": f"{hashlib.md5(sums).hexdigest()}-{n}"}
+
+    def test_s3_multipart_etag_verifies_and_detects_corruption(self):
+        obj = self.root / "SRR000001.sra"
+        obj.write_bytes(bytes(range(256)) * (S3_PART_SIZES[0] // 256 * 2 + 7))
+        item = self.sra_item(obj)
+        self.assertTrue(item["s3_etag"].endswith("-3"))
+        self.assertTrue(source_ok(obj, item))
+        data = bytearray(obj.read_bytes()); data[S3_PART_SIZES[0] + 5] ^= 1; obj.write_bytes(bytes(data))
+        self.assertFalse(source_ok(obj, item))
+        self.assertFalse(s3_etag_matches(obj, "not-an-etag"))
+
+    def test_sra_manifest_entries_validated(self):
+        obj = self.root / "SRR000001.sra"; obj.write_bytes(b"x" * 1000)
+        for platform in ("illumina", "nanopore"):
+            validate_sample(dict(self.s, platform=platform, files=[self.sra_item(obj)]))
+        bad = self.sra_item(obj); del bad["s3_etag"]
+        with self.assertRaises(ValueError): validate_sample(dict(self.s, files=[bad]))
+        with self.assertRaises(ValueError):
+            validate_sample(dict(self.s, platform="illumina", files=[self.sra_item(obj), dict(self.sra_item(obj), name="SRR000002.sra")]))
+
+    def job_mode(self):
+        c = dict(self.c, download_mode="job")
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = str(self.root / ("job_" + key))
+        initialize(c, self.manifest)
+        return c, Path(c["state_dir"]) / "test1", Path(c["scratch_dir"]) / "test1"
+
+    def test_job_mode_submits_new_and_worker_downloads_before_workflow(self):
+        c, state, scratch = self.job_mode()
+        calls = []
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd[0] if cmd[0] in ("sbatch", "curl") else "snakemake")
+            if cmd[0] == "sbatch":
+                return subprocess.CompletedProcess(cmd, 0, "777\n", "")
+            if cmd[0] == "curl":
+                shutil.copyfile(self.raw, cmd[cmd.index("--output") + 1])
+                return subprocess.CompletedProcess(cmd, 0)
+            self.assertTrue((scratch / "raw" / "reads.fastq.gz").is_file())  # download precedes workflow
+            return subprocess.CompletedProcess(cmd, 0)
+        with patch("circlestream.controller.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError): download_one(c)
+            self.assertTrue(submit_one(c))
+            self.assertEqual(status(state), "SUBMITTING")
+            self.assertTrue((scratch / ".owner.json").is_file())
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "777"}):
+                worker(state / "spec.json", "archive")
+        self.assertEqual(calls, ["sbatch", "curl", "snakemake"])
+        self.assertEqual(status(state), "ARCHIVED")
+        self.assertTrue(read_json(state / "download.json")["in_job"])
+
+    def test_job_mode_respects_disk_admission(self):
+        c, state, scratch = self.job_mode()
+        c["scratch_budget_gb"] = self.s["peak_gb"] / 2
+        with patch("circlestream.controller.subprocess.run") as run:
+            self.assertFalse(submit_one(c))
+            run.assert_not_called()
+        self.assertEqual(status(state), "NEW"); self.assertFalse(scratch.exists())
+
+    def test_job_mode_download_failure_is_held(self):
+        c, state, scratch = self.job_mode()
+        c["download_retries"] = 1
+        with patch("circlestream.controller.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "9\n", "")):
+            submit_one(c)
+        with patch("circlestream.controller.subprocess.run", return_value=subprocess.CompletedProcess([], 7)), \
+             patch("circlestream.controller.time.sleep"), patch.dict("os.environ", {"SLURM_JOB_ID": "9"}):
+            with self.assertRaises(RuntimeError): worker(state / "spec.json", "archive")
+        self.assertEqual(status(state), "COMPUTE_FAILED")
+        self.assertIn("In-job download failed", read_json(state / "status.json")["error"])
+
+    def sra_context(self, platform):
+        obj = self.root / "SRR000001.sra"; obj.write_bytes(b"sra")
+        x = SimpleNamespace(s={"platform": platform}, cpus=4, state=self.root / "st", scratch=self.root / "sc")
+        x.state.mkdir(exist_ok=True); (x.scratch / "raw").mkdir(parents=True, exist_ok=True)
+        x.raw_files = [obj]
+        fqd = x.scratch / "raw" / "fastq"
+        x.inputs = [fqd / "SRR000001_1.fastq", fqd / "SRR000001_2.fastq"] if platform == "illumina" else [fqd / "SRR000001.fastq"]
+        return x
+
+    def fake_fqd(self, names):
+        def run(cmd, **kwargs):
+            out = Path(cmd[cmd.index("-O") + 1])
+            for n in names:
+                fq(out / n)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return run
+
+    def test_convert_sra_illumina_drops_orphans_and_records(self):
+        x = self.sra_context("illumina")
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq", "SRR000001.fastq"])):
+            info = convert_sra(x)
+        self.assertEqual(info["dropped_unpaired_files"], ["SRR000001.fastq"])
+        self.assertTrue(all(p.is_file() for p in x.inputs))
+        self.assertFalse((x.scratch / "raw" / "fastq" / "SRR000001.fastq").exists())
+        with patch("circlestream.rules.subprocess.run") as run:
+            convert_sra(x); run.assert_not_called()  # completed conversion is reused
+
+    def test_convert_sra_layout_mismatch_fails(self):
+        x = self.sra_context("illumina")
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001.fastq"])):
+            with self.assertRaises(ValueError): convert_sra(x)
+        x = self.sra_context("nanopore")
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq"])):
+            with self.assertRaises(ValueError): convert_sra(x)
 
 
 if __name__=="__main__": unittest.main()
