@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -490,7 +491,7 @@ class PipelineTests(unittest.TestCase):
             validate_sample(dict(self.s, platform="illumina", files=[self.sra_item(obj), dict(self.sra_item(obj), name="SRR000002.sra")]))
 
     def slurm_mode(self, n=1):
-        c = dict(self.c, download_mode="slurm", fetch={"max_jobs": 1, "batch_gb": 1, "time": "01:00:00", "memory_gb": 1})
+        c = dict(self.c, download_mode="slurm", auto_cleanup=True, fetch={"max_jobs": 1, "batch_gb": 1, "time": "01:00:00", "memory_gb": 1})
         for key in ("state_dir", "scratch_dir", "archive_dir"):
             c[key] = str(self.root / ("sl_" + key))
         write_json(self.manifest, [dict(self.s, sample_id=f"t{i}") for i in range(n)])
@@ -601,6 +602,71 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(status(state), "COMPUTE_FAILED")
         self.assertFalse((local / "circle-stream-778").exists())
         self.assertTrue((Path(c["scratch_dir"]) / "t0" / "raw" / "reads.fastq.gz").is_file())  # source kept for recovery
+
+    def test_slurm_mode_auto_cleanup_false_keeps_staged_source(self):
+        c = self.slurm_mode(1); c["auto_cleanup"] = False
+        # config snapshot must match: re-init a separate run root with the flag off
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = c[key] + "_keep"
+        initialize(c, self.manifest)
+        state = Path(c["state_dir"]) / "t0"; scratch = Path(c["scratch_dir"]) / "t0"
+        local = self.root / "nodetmp"; local.mkdir()
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"), patch("circlestream.controller.reconcile_jobs"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                fetch_specs([state / "spec.json"])
+            submit_one(c)
+        def fake_snakemake(cmd, **kw):
+            x = Context(read_json(state / "spec.json"))
+            ev = x.work / "evidence"; ev.mkdir(parents=True)
+            (ev / "support.bam").write_bytes(b"fake")
+            write_json(ev / "reference.json", {"path": str(self.ref), "sha256": digest(self.ref)})
+            write_json(state / "calls.json", {"candidate_count": 0}); write_json(state / "evidence.json", {"read_ids": 0})
+            archive(x)
+            return subprocess.CompletedProcess(cmd, 0)
+        with patch.dict("os.environ", {"SLURM_JOB_ID": "779", "CS_LOCAL_ROOT": str(local)}), \
+             patch("circlestream.controller.subprocess.run", side_effect=fake_snakemake):
+            worker(state / "spec.json", "archive")
+        self.assertEqual(status(state), "ARCHIVED")
+        self.assertTrue((scratch / "raw" / "reads.fastq.gz").is_file())
+        self.assertFalse((local / "circle-stream-779").exists())  # node-local work is always removed
+
+    def test_slurm_mode_fetch_groups_are_balanced_and_capped(self):
+        c = self.slurm_mode(6)
+        c.update(max_active_samples=6, fetch=dict(c["fetch"], max_jobs=3, batch_gb=100))
+        records = []
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            while submit_fetch(c):
+                pass
+        sizes = [len(read_json(r)["samples"]) for r in fetch_records(c)]
+        self.assertEqual(sizes, [2, 2, 2])  # 6 admissible over 3 free slots, not 6 in one job
+        c2 = self.slurm_mode(5)
+        c2.update(max_active_samples=5, fetch=dict(c2["fetch"], max_jobs=1, batch_gb=100, max_samples=3))
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c2[key] = c2[key] + "_cap"
+        initialize(c2, self.manifest)
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            submit_fetch(c2)
+        self.assertEqual(len(read_json(fetch_records(c2)[0])["samples"]), 3)
+
+    def test_reference_store_is_deduplicated_read_only_and_checked(self):
+        c = dict(self.c, reference_store=str(self.root / "refstore"))
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = str(self.root / ("rs_" + key))
+        write_json(self.manifest, [dict(self.s, sample_id="r1"), dict(self.s, sample_id="r2")])
+        initialize(c, self.manifest)
+        sha = digest(self.ref)
+        stored = Path(c["reference_store"]) / f"{sha}.fa"
+        self.assertEqual(sorted(p.name for p in stored.parent.iterdir()), [stored.name])
+        self.assertEqual(digest(stored), sha)
+        self.assertFalse(stored.stat().st_mode & 0o222)
+        self.assertEqual(read_json(Path(c["state_dir"]) / "r1" / "spec.json")["reference_store_path"], str(stored))
+        os.chmod(stored, 0o644); stored.write_text(">bad\nA\n")
+        write_json(self.manifest, [dict(self.s, sample_id="r3")])
+        with self.assertRaises(ValueError): initialize(c, self.manifest)
 
     def sra_context(self, platform):
         obj = self.root / "SRR000001.sra"; obj.write_bytes(b"sra")

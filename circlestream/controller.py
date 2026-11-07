@@ -50,6 +50,8 @@ def initialize(c, manifest):
             state, scratch = state_paths(c, sample["sample_id"])
             spec = {"config": c, "sample": sample, "repo": str(REPO), "python": sys.executable,
                     "workflow_sha256": workflow_fingerprint(), "reference_sha256": digest(sample["reference"])}
+            if c.get("reference_store"):
+                spec["reference_store_path"] = store_reference(c, sample["reference"], spec["reference_sha256"])
             if state.exists():
                 if read_json(state / "spec.json") != spec:
                     raise ValueError(f"Changed sample or software location: {state.name}; use a new ID/run root")
@@ -62,6 +64,25 @@ def initialize(c, manifest):
             set_status(pending, "NEW")
             os.replace(pending,state)
     print(f"Initialized {len(samples)} samples; no downloads or jobs started")
+
+
+def store_reference(c, path, sha):
+    """Permanent, deduplicated copy named by checksum; archives refer to it instead of embedding it."""
+    store = Path(c["reference_store"])
+    store.mkdir(parents=True, exist_ok=True)
+    dest = store / f"{sha}.fa"
+    if dest.exists():
+        if digest(dest) != sha:
+            raise ValueError(f"Reference store entry is corrupted: {dest}")
+        return str(dest)
+    temp = store / f".{sha}.{os.getpid()}.tmp"
+    shutil.copyfile(path, temp)
+    if digest(temp) != sha:
+        temp.unlink()
+        raise ValueError(f"Reference changed while copying into store: {path}")
+    os.chmod(temp, 0o444)
+    os.replace(temp, dest)
+    return str(dest)
 
 
 def check_snapshot(c):
@@ -222,15 +243,22 @@ def submit_fetch(c):
     f, s = c["fetch"], c["slurm"]
     with lock(Path(c["state_dir"]) / ".submit-lock"):
         reconcile_fetch(c)
-        if len(fetch_records(c)) >= f["max_jobs"]:
+        free_slots = f["max_jobs"] - len(fetch_records(c))
+        if free_slots <= 0:
             return False
+        # Spread admissible samples over all free fetch slots (each fetch job downloads
+        # serially), so several fetch jobs feed processing concurrently.
+        states = entries(c)
+        live = sum(1 for p in states if status(p) not in ("NEW", "CLEANED") and status(p) not in HELD)
+        share = -(-max(0, c["max_active_samples"] - live) // free_slots)
+        cap = max(1, min(f.get("max_samples", 10), share))
         chosen, size = [], 0
-        for state in entries(c):
+        for state in states:
             if status(state) != "NEW":
                 continue
             spec = read_json(state / "spec.json")
             need = sum(x["size_bytes"] for x in spec["sample"]["files"])
-            if chosen and size + need > f["batch_gb"] * GB:
+            if len(chosen) >= cap or (chosen and size + need > f["batch_gb"] * GB):
                 break
             if not admitted(c, spec["sample"]):
                 break
@@ -458,8 +486,9 @@ def worker(spec_path, through):
         finally:
             if local_mode(c):
                 remove_local(root)
-    if local_mode(c) and through == "archive":
-        # Verify the bundle and release the shared source object from inside the job.
+    if local_mode(c) and through == "archive" and c["auto_cleanup"]:
+        # Verify the bundle and release the staged source object from inside the job.
+        # With auto_cleanup=false the staged copy stays until an explicit 'cleanup'.
         try:
             cleanup(c, sample["sample_id"])
         except Exception as error:  # e.g. the login loop holds .cleanup-lock; it will finish

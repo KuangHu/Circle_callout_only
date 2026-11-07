@@ -18,7 +18,11 @@
 - RCA/enriched/ATAC、PacBio、单端 Illumina、低于 75 bp 的普通 WGS 不混入本配置。
 - 已做 adapter trimming 的 Illumina：默认 `caller.short_read_policy="reject"` 拒绝含 <75 bp reads 的样本；设为 `"drop_pair"` 时任一 mate <75 bp 则整对丢弃，其余 reads 保持原长度，`qc.json` 记录总/丢弃/保留 pairs 和保留碱基。FASTQ 截断、配对 ID、质量长度等错误仍然报错。过滤会去掉部分短片段信号，结果需注明该策略。
 - 数据源：ENA HTTPS 在 LRC 实测每连接约 0.7–2.5 MB/s 且整体被限速；NCBI SRA 的 AWS 公开桶（`https://sra-pub-run-odp.s3.amazonaws.com/sra/<run>/<run>`）实测单连接 12–18 MB/s、8 连接 41–55 MB/s。manifest 中可用 `<run>.sra` 单文件条目（`size_bytes` + `s3_etag`，由 `scripts/sra_manifest.py` 通过 HEAD 生成）；下载后校验 S3 multipart ETag，preflight 再跑 `vdb-validate`，qc 用 `fasterq-dump --split-3`（临时文件在节点本地 /tmp）转 FASTQ，Illumina 无配对的 reads 丢弃并记录。需要在 control env 安装 `sra-tools`。
-- `download_mode`：`"dtn"`（默认，DTN 上 `download --watch` + 登录节点 `submit --watch`）或 `"job"`（只运行 `submit --watch`；提交器按磁盘预留直接接纳 NEW 样本，在 Slurm 作业内先下载再跑流程，不需要 DTN 进程，也不需要整节点）。
+- `download_mode`：`"dtn"`（默认：DTN 上 `download --watch` + 登录节点 `submit --watch`）或 `"slurm"`（只需在登录节点用 tmux 保持一个 `submit --watch`；它自动提交 1 核下载作业和计算作业，**不再需要 DTN 的 `download --watch`**）。slurm 模式下：
+  - 下载：最多 `fetch.max_jobs` 个 1 核作业并发；每个作业逐个下载，样本按空闲 fetch 槽位均分，且不超过 `fetch.max_samples` 个、`fetch.batch_gb` GB。实际供给速度需按批次实测，不能只用 `max_jobs × 单流速度` 推算。
+  - 暂存：`scratch_dir` 只放下载的源文件，预算按源文件字节计入 `scratch_budget_gb`。Lustre 元数据延迟高时（实测每次操作 4–30 s），请把暂存目录放在 VAST 组目录。
+  - 计算：在节点本地 `/tmp` 完成，归档并校验后删除本地目录（失败时也删除）。`auto_cleanup=true` 时作业会顺带释放暂存的源文件；为 `false` 时保留，需显式执行 `cleanup`。
+- `reference_store`（可选，强烈建议设置）：init 时把每个参考基因组按 SHA-256 命名、只读地永久保存一份。归档只记录路径和 SHA-256，不再内嵌 FASTA；路径和哈希只能确认身份，不能恢复丢失的文件，所以参考库必须永久保留，并与状态目录、日志、归档、暂存一起计入空间预算。
 - 检出的对象是 **circularization-compatible candidates**。tandem duplication 等结构可能有同样 junction；caller 输出不是物理闭环证明。
 
 ## 架构

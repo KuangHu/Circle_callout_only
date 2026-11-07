@@ -357,7 +357,8 @@ def evidence(x):
     # support.bam can be viewed against the original file, verified by its SHA-256.
     shutil.copy2(str(x.ref)+".fai", ev / "reference.fa.fai")
     write_json(ev / "reference.json", {"path": x.s["reference"], "sha256": x.spec["reference_sha256"],
-                                       "note": "Keep this reference file; archives do not embed a copy"})
+                                       "store_path": x.spec.get("reference_store_path"),
+                                       "note": "Archives do not embed the genome; keep the reference store (or this file)"})
     # Freeze the actual executable workflow, not just a citation to a changing repository.
     code_dest = ev / "pipeline_source"
     for p in list(REPO.glob("*.py")) + list((REPO/"circlestream").glob("*.py")) + list((REPO/"scripts").glob("*.py")) + [REPO/"workflow"/"Snakefile", REPO/"third_party"/"Circle_finder"/"original.sh", REPO/"third_party"/"Circle_finder"/"LICENSE"]:

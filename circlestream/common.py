@@ -160,11 +160,17 @@ def load_config(path):
         raise ValueError("cresil_mode must be depth or linkage")
     if c.get("download_mode", "dtn") not in ("dtn", "slurm"):
         raise ValueError("download_mode must be dtn (DTN downloader) or slurm (1-CPU fetch jobs + node-local work)")
+    if c.get("reference_store"):
+        rs = Path(c["reference_store"])
+        if not rs.is_absolute():
+            raise ValueError("reference_store must be an absolute path")
+        if any(rs == Path(c[k]) or Path(c[k]) in rs.parents for k in ("scratch_dir",)):
+            raise ValueError("reference_store must not live inside scratch (it is permanent)")
     if local_mode(c):
         f = c.get("fetch")
         if not isinstance(f, dict) or not all(k in f for k in ("max_jobs", "batch_gb", "time", "memory_gb")):
             raise ValueError("slurm mode needs fetch: {max_jobs, batch_gb, time, memory_gb}")
-        if f["max_jobs"] <= 0 or f["batch_gb"] <= 0 or f["memory_gb"] <= 0:
+        if f["max_jobs"] <= 0 or f["batch_gb"] <= 0 or f["memory_gb"] <= 0 or f.get("max_samples", 10) <= 0:
             raise ValueError("fetch limits must be positive")
     if c["caller"].get("short_read_policy", "reject") not in ("reject", "drop_pair"):
         raise ValueError("caller.short_read_policy must be reject or drop_pair")
