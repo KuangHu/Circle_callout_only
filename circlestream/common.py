@@ -158,8 +158,14 @@ def load_config(path):
         raise ValueError("CReSIL has internal minimum worker counts: allocate at least 4 CPUs")
     if c["caller"]["cresil_mode"] not in ("depth", "linkage"):
         raise ValueError("cresil_mode must be depth or linkage")
-    if c.get("download_mode", "dtn") not in ("dtn", "job"):
-        raise ValueError("download_mode must be dtn (DTN downloader) or job (download inside the Slurm job)")
+    if c.get("download_mode", "dtn") not in ("dtn", "slurm"):
+        raise ValueError("download_mode must be dtn (DTN downloader) or slurm (1-CPU fetch jobs + node-local work)")
+    if local_mode(c):
+        f = c.get("fetch")
+        if not isinstance(f, dict) or not all(k in f for k in ("max_jobs", "batch_gb", "time", "memory_gb")):
+            raise ValueError("slurm mode needs fetch: {max_jobs, batch_gb, time, memory_gb}")
+        if f["max_jobs"] <= 0 or f["batch_gb"] <= 0 or f["memory_gb"] <= 0:
+            raise ValueError("fetch limits must be positive")
     if c["caller"].get("short_read_policy", "reject") not in ("reject", "drop_pair"):
         raise ValueError("caller.short_read_policy must be reject or drop_pair")
     return c
@@ -168,6 +174,26 @@ def load_config(path):
 def state_paths(c, sid):
     sid = safe_id(sid)
     return Path(c["state_dir"]) / sid, Path(c["scratch_dir"]) / sid
+
+
+def local_mode(c):
+    return c.get("download_mode", "dtn") == "slurm"
+
+
+def work_root(c, sid):
+    """Where a sample's working files live.
+
+    dtn mode: the shared scratch directory (raw + work together).
+    slurm mode: node-local disk of the running job; shared scratch holds only the
+    downloaded source objects. Lustre metadata latency (seconds per operation on LRC)
+    makes per-step small-file work on shared scratch the dominant cost.
+    """
+    if not local_mode(c):
+        return state_paths(c, sid)[1]
+    jid = os.environ.get("SLURM_JOB_ID", "")
+    if not jid.isdigit():
+        raise RuntimeError("Node-local work requires a Slurm allocation")
+    return Path(os.environ.get("CS_LOCAL_ROOT", "/tmp")) / f"circle-stream-{jid}" / safe_id(sid)
 
 
 def set_status(state, status, **extra):

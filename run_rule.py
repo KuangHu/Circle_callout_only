@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from circlestream.common import GB, REPO, read_json, state_paths, tree_size, write_json
+from circlestream.common import GB, REPO, read_json, state_paths, tree_size, work_root, write_json
 
 
 def main():
@@ -26,7 +26,8 @@ def main():
         raise RuntimeError("Real rules require Linux and GNU /usr/bin/time")
     spec = read_json(a.spec)
     c, s = spec["config"], spec["sample"]
-    state, scratch = state_paths(c, s["sample_id"])
+    state, _ = state_paths(c, s["sample_id"])
+    scratch = work_root(c, s["sample_id"])  # node-local in slurm mode; sampled for the peak below
     metrics = state / "metrics"
     metrics.mkdir(exist_ok=True)
     attempt = f"{a.rule}.{time.time_ns()}"

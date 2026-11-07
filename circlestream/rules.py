@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import time
 
-from .common import GB, REPO, digest, fingerprint, is_sra, read_json, source_ok, state_paths, write_json
+from .common import GB, REPO, digest, fingerprint, is_sra, read_json, source_ok, state_paths, work_root, write_json
 from .fastq import extract, materialize
 
 CF_SHA256 = "a7df874bb976cd8761840f91190df43ac3dc949b7e97796441b86b0bb699acd2"
@@ -26,13 +26,14 @@ class Context:
         self.spec = spec
         self.c, self.s = spec["config"], spec["sample"]
         self.state, self.scratch = state_paths(self.c, self.s["sample_id"])
-        self.work = self.scratch / "work"
+        self.root = work_root(self.c, self.s["sample_id"])
+        self.work = self.root / "work"
         self.raw_files = [self.scratch / "raw" / f["name"] for f in self.s["files"]]
         self.sra = any(is_sra(f) for f in self.s["files"])
         if self.sra:
             # FASTQ converted from the SRA object during qc (fasterq-dump --split-3 naming).
             run = self.raw_files[0].stem
-            fq_dir = self.scratch / "raw" / "fastq"
+            fq_dir = self.root / "fastq"
             self.inputs = ([fq_dir / f"{run}_1.fastq", fq_dir / f"{run}_2.fastq"]
                            if self.s["platform"] == "illumina" else [fq_dir / f"{run}.fastq"])
         else:
@@ -115,12 +116,12 @@ def sra_tool(name):
 
 def convert_sra(x):
     """fasterq-dump into raw/fastq; random-access temp files go to node-local disk."""
-    out = x.scratch / "raw" / "fastq"
+    out = x.inputs[0].parent
     if all(p.is_file() for p in x.inputs) and (out / ".complete").is_file():
         return read_json(out / ".complete")
     if out.exists():
         shutil.rmtree(out)  # partial conversion from an interrupted job; source object is retained
-    out.mkdir()
+    out.mkdir(parents=True)
     local = os.environ.get("TMPDIR") if os.environ.get("TMPDIR", "").startswith("/tmp") else "/tmp"
     start = time.time()
     with tempfile.TemporaryDirectory(prefix="cs-fqd-", dir=local) as tmp:
