@@ -60,7 +60,7 @@ class PipelineTests(unittest.TestCase):
         ev=x.work/"evidence"
         ev.mkdir()
         (ev/"support.bam").write_bytes(b"mock-bam-for-control-plane-test")
-        shutil.copy2(self.ref,ev/"reference.fa")
+        write_json(ev/"reference.json",{"path":str(self.ref),"sha256":digest(self.ref)})
         write_json(self.state/"calls.json",{"candidate_count":0})
         write_json(self.state/"evidence.json",{"read_ids":0})
         archive(x)
@@ -449,7 +449,7 @@ class PipelineTests(unittest.TestCase):
                 x = Context(read_json(state / "spec.json"))
                 ev = x.work / "evidence"; ev.mkdir(parents=True)
                 (ev / "support.bam").write_bytes(b"fake-caller-product")
-                shutil.copy2(self.ref, ev / "reference.fa")
+                write_json(ev / "reference.json", {"path": str(self.ref), "sha256": digest(self.ref)})
                 write_json(state / "calls.json", {"candidate_count": 0})
                 write_json(state / "evidence.json", {"read_ids": 0})
                 archive(x)
@@ -573,7 +573,7 @@ class PipelineTests(unittest.TestCase):
             seen["work"] = x.work
             self.assertTrue(str(x.work).startswith(str(local / "circle-stream-777")))
             ev = x.work / "evidence"; ev.mkdir(parents=True)
-            (ev / "support.bam").write_bytes(b"fake"); shutil.copy2(self.ref, ev / "reference.fa")
+            (ev / "support.bam").write_bytes(b"fake"); write_json(ev / "reference.json", {"path": str(self.ref), "sha256": digest(self.ref)})
             write_json(state / "calls.json", {"candidate_count": 0}); write_json(state / "evidence.json", {"read_ids": 0})
             archive(x)
             return subprocess.CompletedProcess(cmd, 0)

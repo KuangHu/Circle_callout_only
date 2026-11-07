@@ -353,8 +353,11 @@ def evidence(x):
             (ev / "empty.sam").unlink()
     x.run(["samtools", "quickcheck", "-v", ev/"support.bam"])
     x.run(["samtools", "index", ev/"support.bam"])
-    shutil.copy2(x.ref, ev / "reference.fa")
+    # Reference by identity, not by copy: one genome copy per sample dominated archive size.
+    # support.bam can be viewed against the original file, verified by its SHA-256.
     shutil.copy2(str(x.ref)+".fai", ev / "reference.fa.fai")
+    write_json(ev / "reference.json", {"path": x.s["reference"], "sha256": x.spec["reference_sha256"],
+                                       "note": "Keep this reference file; archives do not embed a copy"})
     # Freeze the actual executable workflow, not just a citation to a changing repository.
     code_dest = ev / "pipeline_source"
     for p in list(REPO.glob("*.py")) + list((REPO/"circlestream").glob("*.py")) + list((REPO/"scripts").glob("*.py")) + [REPO/"workflow"/"Snakefile", REPO/"third_party"/"Circle_finder"/"original.sh", REPO/"third_party"/"Circle_finder"/"LICENSE"]:
@@ -374,7 +377,7 @@ def archive(x):
     for p in x.state.rglob("*"):
         if p.is_file() and not any(part.startswith(".") for part in p.relative_to(x.state).parts) and not p.name.startswith(("archive.", "slurm-")):
             paths["metadata/"+str(p.relative_to(x.state)).replace(os.sep,"/")] = p
-    required = [x.state/"calls.json", x.state/"evidence.json", ev/"support.bam", ev/"reference.fa"]
+    required = [x.state/"calls.json", x.state/"evidence.json", ev/"support.bam", ev/"reference.json"]
     if any(not p.is_file() for p in required):
         raise ValueError("Missing required evidence")
     if any(p.is_symlink() for p in paths.values()):
@@ -388,7 +391,7 @@ def archive(x):
     if final.exists():
         raise ValueError("Archive already exists; verify/reconcile before overwriting")
     temp = root / (x.s["sample_id"] + ".partial.tar.gz")
-    with tarfile.open(temp, "w:gz", compresslevel=1) as bundle:
+    with tarfile.open(temp, "w:gz", compresslevel=6) as bundle:
         payload = json.dumps(manifest, sort_keys=True).encode()
         info = tarfile.TarInfo("MANIFEST.json")
         info.size = len(payload)
