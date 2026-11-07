@@ -110,6 +110,8 @@ def load_config(path):
         raise ValueError("CReSIL has internal minimum worker counts: allocate at least 4 CPUs")
     if c["caller"]["cresil_mode"] not in ("depth", "linkage"):
         raise ValueError("cresil_mode must be depth or linkage")
+    if c["caller"].get("short_read_policy", "reject") not in ("reject", "drop_pair"):
+        raise ValueError("caller.short_read_policy must be reject or drop_pair")
     return c
 
 

@@ -28,6 +28,7 @@
     "min_region_size": 200,
     "breakpoint_depth": 3,
     "average_depth": 5,
-    "circle_finder_min_non_overlap": 10
+    "circle_finder_min_non_overlap": 10,
+    "short_read_policy": "reject"
   }
 }

@@ -33,7 +33,9 @@ def main():
                         reads[mate].append(f"@r{i}/{mate+1}\n{seq}\n+\n{'I'*len(seq)}\n")
                 else:
                     # Error-free ONT-like lengths exercise plumbing, not real ONT accuracy.
-                    reads[0].append(f"@r{i}\n{fragment}\n+\n{'I'*len(fragment)}\n")
+                    # Real ONT reads come from both strands; CReSIL needs junctions seen from each side.
+                    seq=fragment if rng.random()<0.5 else rc(fragment)
+                    reads[0].append(f"@r{i}\n{seq}\n+\n{'I'*len(seq)}\n")
             length=350 if platform=="illumina" else 1000
             background=genome if case!="tandem" else genome[:end]+circle+genome[end:]
             nbackground=1800 if platform=="illumina" else 600

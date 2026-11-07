@@ -90,7 +90,8 @@ def preflight(x):
 
 
 def qc(x):
-    stats = materialize(x.inputs, x.work / "prepared", x.s["platform"])
+    stats = materialize(x.inputs, x.work / "prepared", x.s["platform"],
+                        x.c["caller"].get("short_read_policy", "reject"))
     write_json(x.state / "qc.json", stats)
 
 
@@ -142,6 +143,10 @@ def circle_finder(x, stage):
     args = [str(max(1, x.cpus-2)), str(x.ref), str(x.work/"prepared"/"reads1.fastq"),
             str(x.work/"prepared"/"reads2.fastq"), str(x.c["caller"]["circle_finder_min_non_overlap"]), "sample", "ref"]
     for index, code in enumerate(cf_lines(stage), 1):
+        if code == "samtools view -@ $1 -bS $6-$7\\.unmap.sam > $6-$7\\.unmap.bam" and (x.out / "sample-ref.unmap.sam").stat().st_size == 0:
+            # samblaster writes no header when nothing is unmapped/clipped; unmap.bam is unused downstream.
+            write_json(x.log / f"cf-{stage}-{index}.json", {"command": code, "skipped": "empty unmap.sam"})
+            continue
         started = time.monotonic()
         x.shell(preamble + code, cwd=x.out, args=args)
         write_json(x.log / f"cf-{stage}-{index}.json", {"command": code, "seconds": time.monotonic()-started})
@@ -257,7 +262,11 @@ def evidence(x):
             x.run(["samtools", "view", x.out/f"sample-ref.{kind}.bam"], stdout=sam)
             with sam.open() as handle:
                 for line in handle:
-                    wanted.add(line.split("\t",1)[0])
+                    name = line.split("\t",1)[0]
+                    # samblaster's splitter file appends _1/_2 (read of pair) to IDs.
+                    if kind == "split" and name.endswith(("_1", "_2")):
+                        name = name[:-2]
+                    wanted.add(name)
             sam.unlink()
         (ev / "read_ids.txt").write_text("".join(n+"\n" for n in sorted(wanted)))
         x.run(["samtools", "view", "-b", "-N", ev/"read_ids.txt", "-o", ev/"support.bam", x.out/"sample-ref.sorted.bam"])

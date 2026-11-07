@@ -188,6 +188,30 @@ class PipelineTests(unittest.TestCase):
         fq(a,("a/1",),50);fq(b,("a/2",),50)
         with self.assertRaises(ValueError): materialize([a,b],self.root/"short","illumina")
 
+    def test_qc_drop_pair_policy(self):
+        a=self.root/"r1.fq";b=self.root/"r2.fq"
+        # pair "s" has a short R2 only; the whole pair must go, other pairs keep full length.
+        a.write_text("@k/1\n"+"A"*150+"\n+\n"+"I"*150+"\n@s/1\n"+"A"*150+"\n+\n"+"I"*150+"\n")
+        b.write_text("@k/2\n"+"C"*120+"\n+\n"+"I"*120+"\n@s/2\n"+"C"*40+"\n+\n"+"I"*40+"\n")
+        with self.assertRaises(ValueError): materialize([a,b],self.root/"strict","illumina")
+        stats=materialize([a,b],self.root/"drop","illumina","drop_pair")
+        self.assertEqual((stats["input_pairs"],stats["dropped_pairs"],stats["retained_pairs"]),(2,1,1))
+        self.assertEqual((stats["reads"],stats["bases"],stats["min_length"]),(2,270,120))
+        self.assertEqual(stats["short_read_policy"],"drop_pair")
+        self.assertEqual((self.root/"drop"/"reads2.fastq").read_text().count("\n"),4)
+
+    def test_qc_drop_pair_does_not_mask_structural_errors(self):
+        a=self.root/"r1.fq";b=self.root/"r2.fq"
+        fq(a,("a/1",),50);fq(b,("b/2",),50)
+        with self.assertRaises(ValueError): materialize([a,b],self.root/"order","illumina","drop_pair")
+        a.write_text("@a/1\nACGT\n+\nII\n");fq(b,("a/2",),4)
+        with self.assertRaises(ValueError): materialize([a,b],self.root/"qual","illumina","drop_pair")
+        fq(a,("a/1","b/1"),100);fq(b,("a/2",),100)
+        with self.assertRaises(ValueError): materialize([a,b],self.root/"count","illumina","drop_pair")
+        fq(a,("a/1",),50);fq(b,("a/2",),50)
+        with self.assertRaisesRegex(ValueError,"No reads remain"): materialize([a,b],self.root/"empty","illumina","drop_pair")
+        with self.assertRaises(ValueError): materialize([a,b],self.root/"bad",'illumina',"truncate")
+
     def test_qc_truncation(self):
         p=self.root/"truncated.fq";p.write_text("@a\nACGT\n+\nII\n")
         with self.assertRaises(ValueError): materialize([p],self.root/"bad","nanopore")
@@ -208,6 +232,36 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 execute(SimpleNamespace(main=call),SimpleNamespace(triminput=str(self.root/"trim.txt")))
         self.assertFalse((self.root/"eccDNA_final.txt").exists())
+
+    def fake_identify_wgls(self, line):
+        import importlib.util
+        path=self.root/"site"/"cresil"/"cli"/"identify_wgls.py"
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(
+            # As with pandas, the KeyError is raised outside identify_wgls.py itself.
+            "ns = {}\nexec(compile(\"class Frame(dict):\\n    def __getitem__(self, key): raise KeyError(f\\\"None of [Index({key!r}, dtype='object')] are in the [columns]\\\")\\n\", '/site/pandas/core/frame.py', 'exec'), ns)\nFrame = ns['Frame']\n"
+            "def main(args):\n    df_rem_bg_aln_reads_merge = Frame()\n    " + line + "\n")
+        spec=importlib.util.spec_from_file_location("fake_identify_wgls",path)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module
+
+    def test_cresil_empty_region_keyerror_is_no_candidate(self):
+        bodies = ("df_rem_bg_aln_reads_merge = df_rem_bg_aln_reads_merge[['chrom','start','end']]",
+                  "df_filtered_breaks_bdg = Frame(); breakpointmerge = 2\n    "
+                  "df_filtered_breaks_bdg = df_filtered_breaks_bdg[df_filtered_breaks_bdg['name'] >= breakpointmerge]")
+        for body in bodies:
+            for name in ("no_candidates.json","eccDNA_final.txt"): (self.root/name).unlink(missing_ok=True)
+            execute(self.fake_identify_wgls(body),SimpleNamespace(triminput=str(self.root/"trim.txt")))
+            self.assertIn("empty-frame",(self.root/"no_candidates.json").read_text())
+            self.assertEqual(len((self.root/"eccDNA_final.txt").read_text().splitlines()),1)
+
+    def test_cresil_other_keyerror_fails(self):
+        for line in ("other = df_rem_bg_aln_reads_merge[['chrom','start','end']]",
+                     "raise KeyError('name')  # df_rem_bg_aln_reads_merge = df_rem_bg_aln_reads_merge[['chrom','start','end']]"):
+            module=self.fake_identify_wgls(line)
+            with self.assertRaises(KeyError):
+                execute(module,SimpleNamespace(triminput=str(self.root/"trim.txt")))
+            self.assertFalse((self.root/"eccDNA_final.txt").exists())
 
     def test_cresil_subprocess_failure_propagates(self):
         with patch("scripts.cresil_wgls_checked.subprocess.run",side_effect=subprocess.CalledProcessError(1,"aligner")) as run:

@@ -26,12 +26,23 @@ def pair_id(name):
     return name[:-2] if name.endswith(("/1", "/2")) else name
 
 
-def materialize(inputs, output, platform):
-    """Full validation, preserving original FASTQ; ONT also gets a FASTA for CReSIL."""
+MIN_ILLUMINA_LENGTH = 75
+
+
+def materialize(inputs, output, platform, short_read_policy="reject"):
+    """Full validation, preserving original FASTQ; ONT also gets a FASTA for CReSIL.
+
+    Illumina pairs with any mate shorter than MIN_ILLUMINA_LENGTH are rejected
+    (default) or, with short_read_policy="drop_pair", dropped as whole pairs.
+    Structural errors (truncation, quality length, pairing, duplicate IDs) always fail.
+    """
     from contextlib import ExitStack
     from itertools import zip_longest
+    if short_read_policy not in ("reject", "drop_pair"):
+        raise ValueError(f"Unknown short_read_policy: {short_read_policy}")
     output.mkdir(exist_ok=True)
     stats = {"reads": 0, "bases": 0, "min_length": None, "max_length": 0}
+    input_records = dropped = 0
     with ExitStack() as stack:
         id_path = output / "read_ids.sqlite"
         id_path.unlink(missing_ok=True)
@@ -51,9 +62,14 @@ def materialize(inputs, output, platform):
                 ids.execute("INSERT INTO ids VALUES (?)", (name,))
             except sqlite3.IntegrityError:
                 raise ValueError(f"Duplicate read/template ID: {name}; independent support cannot be counted reliably")
+            input_records += 1
+            if platform == "illumina" and any(len(seq) < MIN_ILLUMINA_LENGTH for _, _, seq, _ in group):
+                if short_read_policy == "reject":
+                    raise ValueError("Circle_finder ordinary WGS profile requires reads >=75 bp; "
+                                     "set caller.short_read_policy=drop_pair in a new run to drop short pairs")
+                dropped += 1
+                continue
             for writer, (name, header, seq, qual) in zip(writers, group):
-                if platform == "illumina" and len(seq) < 75:
-                    raise ValueError("Circle_finder ordinary WGS profile requires reads >=75 bp; use a separate preprocessing profile")
                 # Normalize pair suffixes only in the derived input, keeping original raw inputs until archive.
                 outname = pair_id(name) if platform == "illumina" else name
                 writer.write(f"@{outname}\n{seq}\n+\n{qual}\n")
@@ -65,7 +81,11 @@ def materialize(inputs, output, platform):
                 stats["max_length"] = max(stats["max_length"], len(seq))
         ids.commit()
     if not stats["reads"]:
-        raise ValueError("Empty FASTQ")
+        raise ValueError("Empty FASTQ" if not input_records else "No reads remain after short-read filtering")
+    if platform == "illumina":
+        stats.update(short_read_policy=short_read_policy, min_read_length=MIN_ILLUMINA_LENGTH,
+                     input_pairs=input_records, dropped_pairs=dropped, retained_pairs=input_records - dropped,
+                     retained_pair_fraction=(input_records - dropped) / input_records)
     return stats
 
 

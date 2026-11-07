@@ -16,6 +16,7 @@
 - 下载使用带大小和 MD5 的公开 HTTPS FASTQ URL，推荐 ENA。SRA accession 本身不能代替下载链接。v0.1 不包含 SRA → FASTQ 转换。
 - 必须显式提供未压缩 reference。v0.1 **不自动组装、不选择参考、不发现参考外序列**。含 IS 的 reference 可以来自独立样本组装，不需要 insertion catalog。
 - RCA/enriched/ATAC、PacBio、单端 Illumina、低于 75 bp 的普通 WGS 不混入本配置。
+- 已做 adapter trimming 的 Illumina：默认 `caller.short_read_policy="reject"` 拒绝含 <75 bp reads 的样本；设为 `"drop_pair"` 时任一 mate <75 bp 则整对丢弃，其余 reads 保持原长度，`qc.json` 记录总/丢弃/保留 pairs 和保留碱基。FASTQ 截断、配对 ID、质量长度等错误仍然报错。过滤会去掉部分短片段信号，结果需注明该策略。
 - 检出的对象是 **circularization-compatible candidates**。tandem duplication 等结构可能有同样 junction；caller 输出不是物理闭环证明。
 
 ## 架构

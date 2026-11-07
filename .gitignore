@@ -7,3 +7,5 @@ samples.local.json
 runtime/
 vendor/
 *.zip
+config.*.json
+!config.example.json
