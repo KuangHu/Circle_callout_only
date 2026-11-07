@@ -668,6 +668,16 @@ class PipelineTests(unittest.TestCase):
         write_json(self.manifest, [dict(self.s, sample_id="r3")])
         with self.assertRaises(ValueError): initialize(c, self.manifest)
 
+    def test_reference_fasta_checks(self):
+        from scripts.prepare_references import check_fasta
+        norm, hmap, n, total = check_fasta(b">c1 len=4 x\nACGT\n>c2\nNNAC\n")
+        self.assertEqual((n, total, hmap), (2, 8, None))
+        self.assertEqual(norm, b">c1 len=4 x\nACGT\n>c2\nNNAC\n")  # safe IDs kept verbatim
+        norm, hmap, _, _ = check_fasta(b">ENA|X1|X1.1 desc\nACGT\n")
+        self.assertEqual(norm, b">ENA_X1_X1.1\nACGT\n"); self.assertEqual(hmap, {"ENA_X1_X1.1": "ENA|X1|X1.1 desc"})
+        for bad in (b">a\nACGT\n>a\nACGT\n", b">a\nAC1T\n", b">a\n>b\nACGT\n", b"ACGT\n", b">a\n"):
+            with self.assertRaises(ValueError): check_fasta(bad)
+
     def sra_context(self, platform):
         obj = self.root / "SRR000001.sra"; obj.write_bytes(b"sra")
         x = SimpleNamespace(s={"platform": platform}, cpus=4, state=self.root / "st", scratch=self.root / "sc")
