@@ -1,5 +1,7 @@
 import argparse
+import collections
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -263,6 +265,7 @@ def call(x):
             nested.rename(x.work / ("cresil_run.failed." + str(time.time_ns())))
         (x.out / "eccDNA_final.txt").unlink(missing_ok=True)
         p = x.c["caller"]
+        junctions = ont_junctions(x)  # genome-wide scan first: independent of CReSIL's outcome
         x.run(["python", REPO/"scripts"/"cresil_wgls_checked.py", "-t", max(4,x.cpus-2), "-m", p["cresil_mode"],
                "-r", str(x.ref)+".mmi", "-fa", x.ref, "-fai", str(x.ref)+".fai",
                "-fq", x.work/"prepared"/"reads.fa", "-trim", x.out/"trim.txt",
@@ -274,30 +277,50 @@ def call(x):
             rows = list(reader)
         if any(r["ctc"] not in ("True", "False") for r in rows):
             raise ValueError("Unexpected CReSIL cyclic flag")
-        junctions = ont_junctions(x)
-        write_json(x.state / "calls.json", {"candidate_count": sum(r["ctc"] == "True" for r in rows),
-            "all_graph_count": len(rows), "classification": "cyclic_graph_candidate_not_topology_proof", "caller": "CReSIL",
-            "cresil_mode": p["cresil_mode"], "ont_junctions": junctions})
+        x.run([sys.executable, REPO / "scripts" / "cresil_trace.py", x.out / "trim.txt", str(x.ref) + ".fai",
+               x.out / "ont_junctions.tsv", x.out, x.out / "cresil_trace.tsv",
+               "--minrsize", p["min_region_size"], "--depth", p["average_depth"]])
+        with (x.out / "cresil_trace.tsv").open() as handle:
+            trace = collections.Counter((r["location"], r["excluded_at"]) for r in csv.DictReader(handle, delimiter="\t"))
+        write_json(x.state / "calls.json", {"caller": "ont_junctions+CReSIL",
+            "classification": "evidence categories, not topology proof",
+            "ont_junctions": junctions,
+            "cresil": {"mode": p["cresil_mode"], "cyclic_graphs": sum(r["ctc"] == "True" for r in rows), "all_graphs": len(rows)},
+            "cresil_trace": {f"{k[0]}/{k[1]}": v for k, v in sorted(trace.items())},
+            # Backwards-compatible field: CReSIL cyclic graphs.
+            "candidate_count": sum(r["ctc"] == "True" for r in rows)})
 
 
 def ont_junctions(x):
     """Direct long-read junction counts (scripts/ont_junctions.py), independent of CReSIL."""
     q = shlex.quote
     paf = x.out / "junctions.paf"
-    x.shell(f"minimap2 -c --secondary=no -x map-ont -t {max(1, x.cpus - 1)} {q(str(x.ref))} "
+    # Secondary alignments (score >= 0.9 x primary) only flag repeat / multi-mapping anchors.
+    x.shell(f"minimap2 -c --secondary=yes -N 5 -p 0.9 -x map-ont -t {max(1, x.cpus - 1)} {q(str(x.ref))} "
             f"{q(str(x.work / 'prepared' / 'reads.fa'))} > {q(str(paf))}")
     flags = []
     for key, value in x.c["caller"].get("ont_junction", {}).items():
         flags += ["--" + key.replace("_", "-"), str(value)]
-    x.run([sys.executable, REPO / "scripts" / "ont_junctions.py", paf, str(x.ref) + ".fai", x.out / "ont_junctions.tsv",
-           "--support-ids", x.out / "ont_junction_ids.txt", *flags])
+    x.run([sys.executable, REPO / "scripts" / "ont_junctions.py", paf, x.ref, x.out / "ont_junctions.tsv",
+           "--events", x.out / "ont_junction_events.tsv", "--support-ids", x.out / "ont_junction_ids.txt", *flags])
+    with (x.out / "ont_junction_ids.txt").open() as handle:
+        ids = {l.strip() for l in handle if l.strip()}
+    # Junction reads' alignments (incl. secondaries) are the classification basis; keep them.
+    with paf.open() as source, gzip.open(x.out / "ont_junctions.support.paf.gz", "wt") as target:
+        for line in source:
+            if line.split("\t", 1)[0] in ids:
+                target.write(line)
+    paf.unlink()  # whole-library alignment: never archived, regenerated from the raw run if needed
     with (x.out / "ont_junctions.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
-    counts = {}
-    for r in rows:
-        counts[r["label"]] = counts.get(r["label"], 0) + 1
-    return {"clusters": len(rows), "by_label": counts,
-            "circle_supported": counts.get("circle_supported", 0), "note": "evidence categories, not topology proof"}
+    by = collections.Counter(f"{r['location']}/{r['label']}" for r in rows)
+    thresholds = {f">={t}": collections.Counter(f"{r['location']}/{r['label']}" for r in rows
+                                                if int(r["independent_molecules"]) >= t) for t in (1, 2, 3, 5, 10)}
+    return {"junctions": len(rows), "by_location_label": dict(sorted(by.items())),
+            "by_min_independent_molecules": {k: dict(sorted(v.items())) for k, v in thresholds.items()},
+            "primary_threshold": "independent_molecules >= 3",
+            "circle_compatible_yes": sum(r["circle_compatible"] == "yes" for r in rows),
+            "note": "evidence categories, not topology proof; whole_contig = replicon closures (technical control)"}
 
 
 def copy_caller_evidence(out, ev, platform, wanted):
@@ -318,9 +341,12 @@ def copy_caller_evidence(out, ev, platform, wanted):
         else:
             keep = rel.as_posix() in {
                 "eccDNA_final.txt", "no_candidates.json", "cresil_run/subGraphs.summary.txt",
-                "ont_junctions.tsv"}
+                "ont_junctions.tsv", "ont_junction_events.tsv", "ont_junction_ids.txt",
+                "ont_junctions.support.paf.gz", "cresil_trace.tsv"}
+            # final_reads.fa holds read sequence for EVERY graph (whole replicons in deep samples:
+            # gigabytes); keep graph -> read ID tables instead (graph_reads.tsv.gz, below).
             keep = keep or (len(rel.parts) == 4 and rel.parts[:2] == ("cresil_run", "assemGraph")
-                            and p.name in {"final_reads.fa", "reference_regions.fa"})
+                            and p.name == "reference_regions.fa")
             dest = ev / "cresil" / rel
         if keep:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -369,13 +395,24 @@ def evidence(x):
         (ev / "read_ids.txt").write_text("".join(n+"\n" for n in sorted(wanted)))
         x.run(["samtools", "view", "-b", "-N", ev/"read_ids.txt", "-o", ev/"support.bam", x.out/"sample-ref.sorted.bam"])
     else:
-        for p in x.out.glob("cresil_run/assemGraph/*/final_reads.fa"):
-            with p.open() as handle:
-                for line in handle:
-                    if line.startswith(">"):
-                        # Upstream format: graphID_originalReadID_queryStart_queryEnd.
-                        header = line[1:].split()[0]
-                        wanted.add(header.split("_",1)[1].rsplit("_",2)[0])
+        cyclic = set()
+        if (x.out / "eccDNA_final.txt").is_file():
+            with (x.out / "eccDNA_final.txt").open() as handle:
+                cyclic = {r["id"] for r in csv.DictReader(handle, delimiter="\t") if r["ctc"] == "True"}
+        (ev / "cresil").mkdir(parents=True, exist_ok=True)
+        with gzip.open(ev / "cresil" / "graph_reads.tsv.gz", "wt") as table:
+            table.write("graph_id\tcyclic\tread_id\tq_start\tq_end\n")
+            for p in sorted(x.out.glob("cresil_run/assemGraph/*/final_reads.fa")):
+                with p.open() as handle:
+                    for line in handle:
+                        if line.startswith(">"):
+                            # Upstream format: graphID_originalReadID_queryStart_queryEnd.
+                            header = line[1:].split()[0]
+                            gid, rest = header.split("_", 1)
+                            rid, qs, qe = rest.rsplit("_", 2)
+                            table.write(f"{gid}\t{gid in cyclic}\t{rid}\t{qs}\t{qe}\n")
+                            if gid in cyclic:  # sequences only for cyclic graphs
+                                wanted.add(rid)
         junction_ids = x.out / "ont_junction_ids.txt"
         if junction_ids.is_file():  # reads behind every junction cluster, whatever its label
             wanted.update(l.strip() for l in junction_ids.open() if l.strip())
@@ -408,7 +445,7 @@ def evidence(x):
         shutil.copy2(p, dest)
     write_json(x.state / "evidence.json", {"read_ids": len(wanted), "records_per_file": counts,
         "bytes_before_archive": sum(p.stat().st_size for p in ev.rglob("*") if p.is_file()),
-        "scope": "all split/discordant read IDs" if x.s["platform"]=="illumina" else "reads in all reported CReSIL graphs, including acyclic",
+        "scope": "all split/discordant read IDs" if x.s["platform"]=="illumina" else "all junction-counter reads (every junction, any label) + reads of CReSIL cyclic graphs; read IDs of all graphs in cresil/graph_reads.tsv.gz",
         "limitation": "Original full-library alternatives require re-download; no physical-topology validation is claimed"})
 
 

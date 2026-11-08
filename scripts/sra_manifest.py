@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 
 BUCKET = "https://sra-pub-run-odp.s3.amazonaws.com/sra"
-PEAK_FACTOR = {"illumina": 30, "nanopore": 12}
+PEAK_FACTOR = {"illumina": 30, "nanopore": 20}
 PEAK_MIN_GB = 2
 
 

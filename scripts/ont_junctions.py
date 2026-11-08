@@ -1,41 +1,64 @@
 #!/usr/bin/env python3
-"""Count circle junctions directly from long-read alignments (PAF from minimap2 -c).
+"""Genome-wide circularization-junction scan from long-read alignments (minimap2 -c PAF).
 
-The long-read counterpart of Circle_finder's split reads, independent of CReSIL:
+Independent of CReSIL and of any insertion or short-read call: every read is examined.
 
-* A junction event is two consecutive alignments of one read (in read order) on the
-  same contig and strand where the read jumps BACK along the reference: on the plus
-  strand it reaches X (end of segment a) and continues at Y < X (start of segment b).
-  The candidate circle is [Y, X). Minus-strand reads are mirrored.
-* Events are clustered by (contig, start, end): an event joins a cluster when both
-  endpoints are within --tolerance bp of the cluster's running median (ONT endpoint
-  jitter otherwise splits one junction into several clusters).
-* Per cluster:
-    junction_reads     reads with at least one event
-    multipass_reads    reads with >= 2 events
-    beyond_unit_reads  reads that reach past one copy of [Y, X): flanking sequence
-                       outside it, or segments covering the same bases twice. A
-                       circle is linearized before sequencing, so a read from a single
-                       circle never does this; a tandem duplication (Y..X Y..X) does
-                       whenever a read is longer than the unit.
-    expected_beyond_if_tandem
-                       junction_reads x (fraction of mapped reads longer than the
-                       unit + 2 x flank): how many beyond-unit reads a tandem copy
-                       would have produced in this library.
-* label (evidence categories, not proof of topology):
-    replicon_junction  end->start of a whole contig (plasmid or closed chromosome);
-                       --replicon-slack covers the terminal overlap that assemblers
-                       leave on circular contigs (up to the largest k-mer, ~127 bp)
-    tandem_or_mixed    >= --min-beyond beyond-unit reads AND >= --min-beyond-frac of
-                       expected_beyond_if_tandem (a lone chimeric read does not count)
-    circle_supported   >= --min-reads junction reads, beyond-unit reads below the
-                       tandem threshold, although
-                       a tandem copy would have given >= --min-expected-beyond
-    junction_ambiguous enough junction reads, but reads too short to tell a circle
-                       from a tandem copy (the same ambiguity as short reads)
-    low_support        fewer than --min-reads junction reads
+    ont_junctions.py ALN.paf REF.fa OUT.tsv [--events EVENTS.tsv] [--support-ids IDS.txt]
 
-    ont_junctions.py ALN.paf REF.fa.fai OUT.tsv [--support-ids IDS.txt]
+ALN.paf must come from `minimap2 -c -x map-ont --secondary=yes -N 5 -p 0.9`; secondary
+alignments are used only to flag repeat / multi-mapping ambiguity. REF.fa: the BioSample's
+own assembly (the same file the other callers use).
+
+Junction event
+    Two consecutive primary alignments of one read (in read order), same contig and strand,
+    query gap <= --max-qgap, where the read jumps BACK on the reference: it reaches X (end of
+    segment a) and continues at Y < X (start of segment b), X - Y >= --min-circle. Candidate
+    unit [Y, X). Minus-strand reads are mirrored. Every event is written to --events with raw
+    coordinates, anchors, mapping qualities, repeat flags and outside-flank lengths.
+    No read has to cover the whole unit and no second pass is required.
+
+Per event
+    anchor_a / anchor_b   aligned reference bp of the segments before / after the junction
+    unique_a / unique_b   mapq >= --min-mapq and no secondary alignment of the same read
+                          bases scoring >= --repeat-score-frac of the primary
+    outside_bp            bp of the segment reaching X (or starting at Y) aligned OUTSIDE
+                          [Y, X): the same alignment continues from the unit into flanking
+                          genome. unique_outside_bp counts it only on a unique segment; that
+                          links the junction to unique outside sequence, i.e. a linear form
+                          (tandem copy, or an integrated copy) exists.
+    overlap_bp            bp covered by both segments (the read passes the same bases twice).
+                          Recorded only: multimeric circles, rolling-circle products and
+                          tandem arrays all produce it, so it proves no topology.
+
+Clusters and equivalent breakpoints
+    Events cluster when both endpoints are within --tolerance bp of a cluster's running
+    median. Each cluster's junction is shifted to its left-most equivalent position using the
+    reference: with microhomology (ref[Y-i] == ref[X-i], i = 1..h) junctions (Y-i, X-i) are
+    indistinguishable. Clusters that coincide afterwards are merged; their raw medians and IDs
+    stay in raw_clusters, and every event keeps its raw coordinates.
+
+Independent support
+    junction_reads          distinct read IDs
+    independent_molecules   reads grouped when the reference positions where they start and
+                            stop (the molecule's cut ends) agree within --dup-tolerance bp,
+                            strand ignored: duplex template/complement pairs and duplicate
+                            records count once. Thresholds use this number.
+
+Labels (evidence categories, never topology proof)
+    tandem_supported    >= --min-tandem-reads independent molecules link the junction to
+                        unique outside sequence (unique_outside_bp >= --flank). Does not
+                        exclude circles of the same unit in the same culture.
+    junction_supported  >= 1 independent molecule with both anchors unique and >= --min-anchor,
+                        and not tandem_supported.
+    ambiguous           junction reads only with non-unique (repeat / multi-mapping) or short
+                        anchors.
+    circle_compatible   column, not a label: "yes" when junction_supported, no molecule reaches
+                        outside sequence, and the library's read lengths would have given
+                        >= --min-expected-flank such molecules under a simple tandem; "no" when
+                        any molecule reaches outside; "na" otherwise. Compatible != confirmed.
+location: whole_contig (end -> start of a whole contig within --edge bp, which also absorbs the
+terminal overlap assemblers leave on circular contigs), contig_edge (one end within --edge),
+internal. support_ge3: independent_molecules >= 3 (primary-result threshold).
 """
 import argparse
 import bisect
@@ -43,143 +66,245 @@ import collections
 import csv
 import sys
 
+COLS = ["junction_id", "contig", "start", "end", "length", "contig_length", "location", "raw_clusters",
+        "microhomology_bp", "junction_reads", "junction_events", "independent_molecules", "anchored_molecules",
+        "repeat_ambiguous_molecules", "tandem_flank_molecules", "multipass_molecules", "expected_flank_if_tandem",
+        "label", "circle_compatible", "support_ge3"]
+EVENT_COLS = ["read", "junction_id", "cluster_raw", "contig", "strand", "raw_start", "raw_end", "start", "end",
+              "anchor_a", "anchor_b", "mapq_a", "mapq_b", "unique_a", "unique_b", "outside_bp",
+              "unique_outside_bp", "overlap_bp", "molecule_start", "molecule_end"]
 
-def read_paf(path, min_mapq, min_aln):
-    by_read = collections.defaultdict(list)
+
+def read_fasta(path):
+    seqs, name, chunks = {}, None, []
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith(">"):
+                if name is not None:
+                    seqs[name] = "".join(chunks).upper()
+                name, chunks = line[1:].split()[0], []
+            else:
+                chunks.append(line.strip())
+    if name is not None:
+        seqs[name] = "".join(chunks).upper()
+    return seqs
+
+
+def tag(fields, key, default=None):
+    for t in fields:
+        if t.startswith(key):
+            return t[len(key):]
+    return default
+
+
+def read_paf(path, min_aln):
+    """{read: [primaries, secondaries, {query lengths}]}; primaries include supplementary (tp:A:P)."""
+    reads = collections.defaultdict(lambda: ([], [], set()))
     with open(path) as handle:
         for line in handle:
             f = line.rstrip("\n").split("\t")
             if len(f) < 12:
                 raise ValueError(f"Malformed PAF line: {line[:80]!r}")
-            tags = f[12:]
-            if any(t.startswith("tp:A:") and t not in ("tp:A:P",) for t in tags):
-                continue  # keep primary chains only (supplementary alignments are also tp:A:P)
-            qs, qe, ts, te, mapq = int(f[2]), int(f[3]), int(f[7]), int(f[8]), int(f[11])
-            if mapq < min_mapq or te - ts < min_aln:
-                continue
-            by_read[f[0]].append((qs, qe, f[5], ts, te, f[4], int(f[1])))
-    return by_read
+            tp = tag(f[12:], "tp:A:", "P")
+            ts, te = int(f[7]), int(f[8])
+            seg = {"qs": int(f[2]), "qe": int(f[3]), "contig": f[5], "ts": ts, "te": te, "strand": f[4],
+                   "mapq": int(f[11]), "score": int(tag(f[12:], "AS:i:", tag(f[12:], "ms:i:", f[9])))}
+            entry = reads[f[0]]
+            entry[2].add(int(f[1]))
+            if tp == "P" and te - ts >= min_aln:
+                entry[0].append(seg)
+            elif tp == "S":
+                entry[1].append(seg)
+    return reads
 
 
-def events_for_read(segs, max_qgap, min_circle):
-    """[(contig, start, end, beyond_bp)] for each back-jump in read order.
+def is_unique(seg, secondaries, min_mapq, frac):
+    if seg["mapq"] < min_mapq:
+        return False
+    for s in secondaries:
+        ov = min(seg["qe"], s["qe"]) - max(seg["qs"], s["qs"])
+        if ov >= 0.5 * (seg["qe"] - seg["qs"]) and s["score"] >= frac * seg["score"]:
+            return False
+    return True
 
-    beyond_bp: how far the read reaches past ONE copy of [start, end): flanking sequence
-    outside it, or segments a and b covering the same reference bases. A read from a
-    single (linearized) circle can never do either; a tandem duplication can.
-    """
-    segs = sorted(segs)
+
+def events_for_read(prim, sec, o):
+    prim = sorted(prim, key=lambda s: (s["qs"], s["qe"]))
     out = []
-    for a, b in zip(segs, segs[1:]):
-        if a[2] != b[2] or a[5] != b[5] or abs(b[0] - a[1]) > max_qgap:
+    for a, b in zip(prim, prim[1:]):
+        if a["contig"] != b["contig"] or a["strand"] != b["strand"] or abs(b["qs"] - a["qe"]) > o.max_qgap:
             continue
-        if a[5] == "+":
-            start, end = b[3], a[4]           # read: ... -> X=a.te, then Y=b.ts
-            outside = max(start - a[3], b[4] - end, 0)
+        if a["strand"] == "+":
+            start, end = b["ts"], a["te"]       # read: ... -> X = a.te, then continues at Y = b.ts
+            at_x, at_y = a, b                   # segment ending at X / segment starting at Y
+            mol = (a["ts"], b["te"])            # where the read starts and stops on the reference
         else:
-            start, end = a[3], b[4]           # mirrored: reference positions run downward
-            outside = max(start - b[3], a[4] - end, 0)
-        overlap = max(0, min(a[4], b[4]) - max(a[3], b[3]))
-        if end - start >= min_circle:  # a genuine jump back (indel splits give end <= start)
-            out.append((a[2], start, end, max(outside, overlap)))
+            start, end = a["ts"], b["te"]       # mirrored: a starts (ref) at Y, b ends at X
+            at_x, at_y = b, a
+            mol = (a["te"], b["ts"])
+        if end - start < o.min_circle:
+            continue                            # indel split or forward jump, not a back-jump
+        ua = is_unique(a, sec, o.min_mapq, o.repeat_score_frac)
+        ub = is_unique(b, sec, o.min_mapq, o.repeat_score_frac)
+        uniq = {id(a): ua, id(b): ub}
+        out_x = max(0, start - at_x["ts"])      # segment reaching X began left of Y
+        out_y = max(0, at_y["te"] - end)        # segment starting at Y runs past X
+        out.append({"contig": a["contig"], "strand": a["strand"], "start": start, "end": end,
+                    "anchor_a": a["te"] - a["ts"], "anchor_b": b["te"] - b["ts"],
+                    "mapq_a": a["mapq"], "mapq_b": b["mapq"], "unique_a": ua, "unique_b": ub,
+                    "outside_bp": max(out_x, out_y),
+                    "unique_outside_bp": max(out_x if uniq[id(at_x)] else 0, out_y if uniq[id(at_y)] else 0),
+                    "overlap_bp": max(0, min(a["te"], b["te"]) - max(a["ts"], b["ts"])),
+                    "molecule_start": min(mol), "molecule_end": max(mol)})
     return out
 
 
 def cluster(events, tolerance):
-    """Cluster on (contig, start, end) against each cluster's running median endpoints.
-
-    Sorted by (contig, start, end); an event joins the nearest recent cluster whose median
-    start and end are both within tolerance. Returns clusters of event indices."""
-    order = sorted(range(len(events)), key=lambda i: (events[i][1], events[i][2], events[i][3]))
+    order = sorted(range(len(events)), key=lambda i: (events[i]["contig"], events[i]["start"], events[i]["end"]))
     clusters = []
     for i in order:
-        contig, s, e = events[i][1], events[i][2], events[i][3]
+        e = events[i]
         best = None
         for c in reversed(clusters[-50:]):
-            if c["contig"] == contig and abs(c["s"] - s) <= tolerance and abs(c["e"] - e) <= tolerance:
-                d = abs(c["s"] - s) + abs(c["e"] - e)
+            if c["contig"] == e["contig"] and abs(c["s"] - e["start"]) <= tolerance and abs(c["e"] - e["end"]) <= tolerance:
+                d = abs(c["s"] - e["start"]) + abs(c["e"] - e["end"])
                 if best is None or d < best[0]:
                     best = (d, c)
         if best:
             c = best[1]
-            c["members"].append(i); bisect.insort(c["ss"], s); bisect.insort(c["es"], e)
+            c["members"].append(i); bisect.insort(c["ss"], e["start"]); bisect.insort(c["es"], e["end"])
             c["s"], c["e"] = c["ss"][len(c["ss"]) // 2], c["es"][len(c["es"]) // 2]
         else:
-            clusters.append({"contig": contig, "s": s, "e": e, "ss": [s], "es": [e], "members": [i]})
+            clusters.append({"contig": e["contig"], "s": e["start"], "e": e["end"],
+                             "ss": [e["start"]], "es": [e["end"]], "members": [i]})
     return clusters
+
+
+def microhomology(seq, start, end, limit=200):
+    """(left, right): junction (start, end) equals (start-i, end-i) for i <= left and
+    (start+i, end+i) for i <= right, because the reference bases at both ends are identical."""
+    left = 0
+    while left < limit and start - left - 1 >= 0 and seq[start - left - 1] == seq[end - left - 1] != "N":
+        left += 1
+    right = 0
+    while right < limit and end + right < len(seq) and seq[start + right] == seq[end + right] != "N":
+        right += 1
+    return left, right
+
+
+def molecules(members, tol):
+    groups = []
+    for e in sorted(members, key=lambda e: (e["molecule_start"], e["molecule_end"])):
+        for g in groups:
+            if abs(g[0][0] - e["molecule_start"]) <= tol and abs(g[0][1] - e["molecule_end"]) <= tol:
+                g[1].append(e); break
+        else:
+            groups.append(((e["molecule_start"], e["molecule_end"]), [e]))
+    return [g[1] for g in groups]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paf"); ap.add_argument("fai"); ap.add_argument("out")
-    ap.add_argument("--support-ids")
+    ap.add_argument("paf"); ap.add_argument("ref"); ap.add_argument("out")
+    ap.add_argument("--events"); ap.add_argument("--support-ids")
     ap.add_argument("--min-mapq", type=int, default=20)
     ap.add_argument("--min-aln", type=int, default=200)
+    ap.add_argument("--min-anchor", type=int, default=300)
     ap.add_argument("--max-qgap", type=int, default=200)
     ap.add_argument("--min-circle", type=int, default=100)
     ap.add_argument("--tolerance", type=int, default=50)
     ap.add_argument("--flank", type=int, default=100)
-    ap.add_argument("--min-reads", type=int, default=3)
-    ap.add_argument("--replicon-slack", type=int, default=150)
-    ap.add_argument("--min-expected-beyond", type=float, default=3.0)
-    ap.add_argument("--min-beyond", type=int, default=2, help="beyond-unit reads needed to call tandem_or_mixed")
-    ap.add_argument("--min-beyond-frac", type=float, default=0.1,
-                    help="...and at least this fraction of expected_beyond_if_tandem")
-    a = ap.parse_args()
-    lengths = {l.split("\t")[0]: int(l.split("\t")[1]) for l in open(a.fai) if l.strip()}
-    events = []  # (read, contig, start, end, beyond)
-    paf = read_paf(a.paf, a.min_mapq, a.min_aln)
-    read_lengths = sorted(segs[0][6] for segs in paf.values())
-    for read, segs in paf.items():
-        for contig, s, e, beyond in events_for_read(segs, a.max_qgap, a.min_circle):
-            L = lengths.get(contig)
-            if L is not None and s <= a.replicon_slack and e >= L - a.replicon_slack:
-                s, e = 0, L  # end->start of the whole contig: one cluster per replicon
-            events.append((read, contig, s, e, beyond))
-    rows = []
-    support = set()
-    for c in cluster(events, a.tolerance):
-        members = [events[i] for i in c["members"]]
-        per_read = collections.Counter(m[0] for m in members)
-        beyond = {m[0] for m in members if m[4] > a.flank}
-        starts = sorted(m[2] for m in members); ends = sorted(m[3] for m in members)
-        start, end = starts[len(starts) // 2], ends[len(ends) // 2]
-        L = lengths.get(c["contig"])
-        if L is None:
-            raise ValueError(f"Contig {c['contig']} not in {a.fai}")
-        # Under a tandem duplication, junction reads longer than one unit (+ flank) would
-        # reach beyond it. Expected number: junction reads x library fraction that long.
-        need = end - start + 2 * a.flank
-        frac_long = (len(read_lengths) - bisect.bisect_left(read_lengths, need)) / max(1, len(read_lengths))
-        expected_beyond = len(per_read) * frac_long
-        if start <= a.replicon_slack and end >= L - a.replicon_slack:
-            label = "replicon_junction"
-        elif len(beyond) >= a.min_beyond and len(beyond) >= a.min_beyond_frac * expected_beyond:
-            label = "tandem_or_mixed"
-        elif len(per_read) < a.min_reads:
-            label = "low_support"
-        elif expected_beyond >= a.min_expected_beyond:
-            label = "circle_supported"
+    ap.add_argument("--edge", type=int, default=150)
+    ap.add_argument("--dup-tolerance", type=int, default=10)
+    ap.add_argument("--repeat-score-frac", type=float, default=0.9)
+    ap.add_argument("--min-tandem-reads", type=int, default=2)
+    ap.add_argument("--min-expected-flank", type=float, default=3.0)
+    o = ap.parse_args()
+
+    seqs = read_fasta(o.ref)
+    lengths = {k: len(v) for k, v in seqs.items()}
+    reads = read_paf(o.paf, o.min_aln)
+    read_lengths = sorted(max(q) for _, _, q in reads.values() if q)
+    dup_names = sum(1 for _, _, q in reads.values() if len(q) > 1)
+
+    events = []
+    for name, (prim, sec, _) in reads.items():
+        for e in events_for_read(prim, sec, o):
+            L = lengths[e["contig"]]
+            e["raw_start"], e["raw_end"], e["read"] = e["start"], e["end"], name
+            if e["start"] <= o.edge and e["end"] >= L - o.edge:
+                e["start"], e["end"] = 0, L     # end -> start of a whole contig: one closure per replicon
+            events.append(e)
+
+    loci = {}
+    for cid, c in enumerate(cluster(events, o.tolerance), 1):
+        seq, L = seqs[c["contig"]], lengths[c["contig"]]
+        s, e = c["s"], c["e"]
+        left, right = (0, 0) if (s == 0 and e == L) else microhomology(seq, s, e)
+        key = (c["contig"], s - left, e - left)
+        for m in c["members"]:
+            events[m]["cluster_raw"] = cid
+        l = loci.setdefault(key, {"raw": [], "members": [], "mh": 0})
+        l["raw"].append((cid, s, e)); l["members"] += c["members"]; l["mh"] = max(l["mh"], left + right)
+
+    rows, support = [], set()
+    for jid, (key, l) in enumerate(sorted(loci.items()), 1):
+        contig, start, end = key
+        L = lengths[contig]
+        members = [events[m] for m in l["members"]]
+        for m in members:
+            m["junction_id"] = jid
+        mols = molecules(members, o.dup_tolerance)
+        anchored = [g for g in mols if any(m["unique_a"] and m["unique_b"] and min(m["anchor_a"], m["anchor_b"]) >= o.min_anchor for m in g)]
+        tandem = [g for g in mols if any(m["unique_outside_bp"] >= o.flank for m in g)]
+        repeat = [g for g in mols if all(not (m["unique_a"] and m["unique_b"]) for m in g)]
+        multipass = sum(1 for g in mols if len({m["read"] for m in g}) < len(g) or any(m["overlap_bp"] > o.flank for m in g))
+        need = (end - start) + 2 * o.flank
+        expected = len(mols) * (len(read_lengths) - bisect.bisect_left(read_lengths, need)) / max(1, len(read_lengths))
+        if start <= o.edge and end >= L - o.edge:
+            location = "whole_contig"
+        elif start <= o.edge or end >= L - o.edge:
+            location = "contig_edge"
         else:
-            label = "junction_ambiguous"  # reads too short to tell a circle from a tandem copy
-        support.update(per_read)
-        rows.append({"contig": c["contig"], "start": start, "end": end, "length": end - start,
-                     "contig_length": L, "junction_reads": len(per_read), "junction_events": len(members),
-                     "multipass_reads": sum(1 for n in per_read.values() if n >= 2),
-                     "beyond_unit_reads": len(beyond), "expected_beyond_if_tandem": round(expected_beyond, 2),
-                     "label": label})
-    rows.sort(key=lambda r: (-r["junction_reads"], r["contig"], r["start"]))
-    cols = ["contig", "start", "end", "length", "contig_length", "junction_reads", "junction_events",
-            "multipass_reads", "beyond_unit_reads", "expected_beyond_if_tandem", "label"]
-    with open(a.out, "w", newline="") as handle:
-        w = csv.DictWriter(handle, fieldnames=cols, delimiter="\t", lineterminator="\n")
+            location = "internal"
+        if len(tandem) >= o.min_tandem_reads:
+            label = "tandem_supported"
+        elif anchored:
+            label = "junction_supported"
+        else:
+            label = "ambiguous"
+        if tandem:
+            compatible = "no"
+        elif label == "junction_supported" and expected >= o.min_expected_flank:
+            compatible = "yes"
+        else:
+            compatible = "na"
+        names = sorted({m["read"] for m in members})
+        support.update(names)
+        rows.append({"junction_id": jid, "contig": contig, "start": start, "end": end, "length": end - start,
+                     "contig_length": L, "location": location,
+                     "raw_clusters": ";".join(f"{cid}:{s}-{e}" for cid, s, e in l["raw"]),
+                     "microhomology_bp": l["mh"], "junction_reads": len(names), "junction_events": len(members),
+                     "independent_molecules": len(mols), "anchored_molecules": len(anchored),
+                     "repeat_ambiguous_molecules": len(repeat), "tandem_flank_molecules": len(tandem),
+                     "multipass_molecules": multipass, "expected_flank_if_tandem": round(expected, 2),
+                     "label": label, "circle_compatible": compatible,
+                     "support_ge3": "yes" if len(mols) >= 3 else "no"})
+    rows.sort(key=lambda r: (-r["independent_molecules"], r["contig"], r["start"]))
+    with open(o.out, "w", newline="") as handle:
+        w = csv.DictWriter(handle, fieldnames=COLS, delimiter="\t", lineterminator="\n")
         w.writeheader(); w.writerows(rows)
-    if a.support_ids:
-        with open(a.support_ids, "w") as handle:
+    if o.events:
+        with open(o.events, "w", newline="") as handle:
+            w = csv.DictWriter(handle, fieldnames=EVENT_COLS, delimiter="\t", lineterminator="\n", extrasaction="ignore")
+            w.writeheader(); w.writerows(sorted(events, key=lambda e: (e["junction_id"], e["read"])))
+    if o.support_ids:
+        with open(o.support_ids, "w") as handle:
             handle.writelines(r + "\n" for r in sorted(support))
-    counts = collections.Counter(r["label"] for r in rows)
-    print(f"ont_junctions: {len(events)} events, {len(rows)} clusters, " +
-          ", ".join(f"{k}={v}" for k, v in sorted(counts.items())), file=sys.stderr)
+    counts = collections.Counter((r["location"], r["label"]) for r in rows)
+    print(f"ont_junctions: {len(reads)} reads, {len(events)} events, {len(rows)} junctions, "
+          f"read names with differing lengths {dup_names}; " +
+          ", ".join(f"{k[0]}/{k[1]}={v}" for k, v in sorted(counts.items())), file=sys.stderr)
 
 
 if __name__ == "__main__":
