@@ -2,7 +2,7 @@
 """ONT-first per-BioSample summary: junction counter vs CReSIL, with Illumina cross-support.
 
     compare_platforms.py --ont DIR [DIR ...] [--illumina DIR [DIR ...]] --out OUTDIR
-                         [--tol 50] [--frac 0.02]
+                         [--same-culture same_culture.tsv] [--min-breadth 0.8] [--tol 50] [--frac 0.02]
 
 --ont dirs hold <SID>_ont.tar.gz (or <SID>.tar.gz) archives from the v3 pipeline; a later dir
 wins for a repeated BioSample (reruns). --illumina dirs hold <SID>_ill.tar.gz or <SID>.tar.gz
@@ -11,6 +11,12 @@ Circle_finder archives; Illumina is optional cross-support, never a precondition
 Matching (same contig): endpoints within max(tol, frac x length) of each other, OR shifted
 together along the junction's microhomology (|d_start - d_end| <= tol and |d_start| <=
 microhomology_bp + tol), since such junctions are indistinguishable.
+
+Library QC (per sample, from evidence/cresil/contig_depth.tsv): breadth = fraction of the
+assembly in contigs with depth >= 0.1 x the assembly mean. Below --min-breadth the ONT library
+is not genome-wide (targeted / enriched / wrong assembly): kept and listed, but summary counts
+are also given for QC-passing samples only. With --same-culture (same_culture.py), Illumina of a
+genome_mismatch pair is not used as cross-support (column left blank, as for no Illumina).
 
 Outputs
   ont_junctions.tsv  every ONT junction, all labels, with CReSIL trace outcome, Illumina
@@ -72,15 +78,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ont", nargs="+", required=True); ap.add_argument("--illumina", nargs="*", default=[])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--same-culture"); ap.add_argument("--min-breadth", type=float, default=0.8)
     ap.add_argument("--tol", type=int, default=50); ap.add_argument("--frac", type=float, default=0.02)
     a = ap.parse_args()
     ont = archive_map(a.ont, "_ont")
     ill = archive_map(a.illumina, "_ill")
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    culture = {}
+    if a.same_culture:
+        culture = {r["sample"]: r["verdict"] for r in csv.DictReader(open(a.same_culture), delimiter="\t")}
     rows, per = [], []
     for sid, path in sorted(ont.items()):
         m = read_members(path, {"j": "evidence/cresil/ont_junctions.tsv", "t": "evidence/cresil/cresil_trace.tsv",
-                                "e": "evidence/cresil/eccDNA_final.txt"})
+                                "e": "evidence/cresil/eccDNA_final.txt", "d": "evidence/cresil/contig_depth.tsv"})
         if "j" not in m:
             per.append({"sample": sid, "status": "not a v3 ONT archive"}); continue
         junc, trace = tsv(m["j"]), {r["junction_id"]: r for r in tsv(m.get("t"))}
@@ -88,8 +98,13 @@ def main():
         if "e" in m:
             ef = out / ".eccDNA_final.tmp"
             ef.write_text(m["e"]); cres = final_spans(ef, 100); ef.unlink()
+        depth = [(int(r["length"]), int(r["aligned_bases"])) for r in tsv(m.get("d"))]
+        asm = sum(L for L, _ in depth)
+        mean = sum(b for _, b in depth) / max(1, asm)
+        breadth = sum(L for L, b in depth if mean and b / L >= 0.1 * mean) / max(1, asm) if depth else None
+        qc = "no_depth" if breadth is None else ("pass" if breadth >= a.min_breadth else "partial_genome_library")
         icalls = None
-        if sid in ill:
+        if sid in ill and culture.get(sid) != "genome_mismatch":
             im = read_members(ill[sid], {"jt": "sample-ref.microDNA-JT.txt"})
             icalls = [(f[0], int(f[1]), int(f[2]), int(f[3])) for f in
                       (l.split("\t") for l in im.get("jt", "").splitlines()) if len(f) >= 4]
@@ -102,12 +117,13 @@ def main():
                 excl = "in_final_graph"  # archives traced before the spanning rule: overlap only
             if excl == "kept_cyclic" and not any(c[4] for c in hit_c):
                 excl = "cyclic"
-            rows.append(dict(j, sample=sid,
+            rows.append(dict(j, sample=sid, library_qc=qc,
                              cresil_match=";".join(sorted({c[3] + ("(cyclic)" if c[4] else "") for c in hit_c})) or "none",
                              cresil_excluded_at=excl,
                              illumina_split_reads="" if icalls is None else max([c[3] for c in hit_i], default=0)))
         sr = [r for r in rows if r["sample"] == sid]
-        per.append({"sample": sid, "status": "ok", "illumina": "yes" if icalls is not None else "no",
+        per.append({"sample": sid, "status": "ok", "library_qc": qc, "breadth": "" if breadth is None else round(breadth, 3),
+                    "same_culture": culture.get(sid, ""), "illumina": "yes" if icalls is not None else "no",
                     "junctions": len(sr),
                     "internal_ge3": sum(r["location"] != "whole_contig" and int(r["independent_molecules"]) >= 3 for r in sr),
                     "whole_contig": sum(r["location"] == "whole_contig" for r in sr),
@@ -125,15 +141,23 @@ def main():
         return dict(sorted(collections.Counter(f"{r['location']}/{r['label']}" for r in rows if pred(r)).items()))
     ge = lambda r, t: int(r["independent_molecules"]) >= t  # noqa: E731
     with_ill = lambda r: r["illumina_split_reads"] != ""  # noqa: E731
+    def primary(keep):
+        return {"all": count(lambda r: keep(r) and ge(r, 3)),
+                "ont_only_where_illumina_exists": count(lambda r: keep(r) and ge(r, 3) and with_ill(r) and int(r["illumina_split_reads"]) == 0),
+                "illumina_supported_ge1": count(lambda r: keep(r) and ge(r, 3) and with_ill(r) and int(r["illumina_split_reads"]) >= 1),
+                "illumina_supported_ge3": count(lambda r: keep(r) and ge(r, 3) and with_ill(r) and int(r["illumina_split_reads"]) >= 3),
+                "cresil_cyclic_match": count(lambda r: keep(r) and ge(r, 3) and "(cyclic)" in r["cresil_match"]),
+                "cresil_excluded_at": dict(sorted(collections.Counter(f"{r['location']}/{r['cresil_excluded_at']}" for r in rows if keep(r) and ge(r, 3)).items())),
+                "circle_compatible_yes": count(lambda r: keep(r) and ge(r, 3) and r["circle_compatible"] == "yes")}
+    qc_pass = lambda r: r["library_qc"] == "pass"  # noqa: E731
     s = {"samples": sum(p["status"] == "ok" for p in per), "samples_with_illumina": sum(p.get("illumina") == "yes" for p in per),
+         "samples_library_qc_pass": sum(p.get("library_qc") == "pass" for p in per),
+         "library_qc_not_pass": {p["sample"]: f"{p['library_qc']} (breadth {p['breadth']})" for p in per if p.get("library_qc") not in (None, "pass")},
+         "same_culture": dict(collections.Counter(p.get("same_culture") or "not checked" for p in per if p["status"] == "ok")),
          "by_min_independent_molecules": {f">={t}": count(lambda r, t=t: ge(r, t)) for t in THRESHOLDS},
-         "primary_ge3": {"all": count(lambda r: ge(r, 3)),
-                         "ont_only_where_illumina_exists": count(lambda r: ge(r, 3) and with_ill(r) and int(r["illumina_split_reads"]) == 0),
-                         "illumina_supported_ge1": count(lambda r: ge(r, 3) and with_ill(r) and int(r["illumina_split_reads"]) >= 1),
-                         "illumina_supported_ge3": count(lambda r: ge(r, 3) and with_ill(r) and int(r["illumina_split_reads"]) >= 3),
-                         "cresil_cyclic_match": count(lambda r: ge(r, 3) and "(cyclic)" in r["cresil_match"]),
-                         "cresil_excluded_at": dict(collections.Counter(f"{r['location']}/{r['cresil_excluded_at']}" for r in rows if ge(r, 3))),
-                         "circle_compatible_yes": count(lambda r: ge(r, 3) and r["circle_compatible"] == "yes")},
+         "by_min_independent_molecules_qc_pass": {f">={t}": count(lambda r, t=t: qc_pass(r) and ge(r, t)) for t in THRESHOLDS},
+         "primary_ge3": primary(lambda r: True),
+         "primary_ge3_qc_pass": primary(qc_pass),
          "match_rule": f"same contig; endpoints within max({a.tol} bp, {a.frac} x length) or shifted together within microhomology + {a.tol} bp",
          "caveat": "labels are evidence categories, not confirmed circles; whole_contig rows are replicon closures (technical control)"}
     json.dump(s, open(out / "summary.json", "w"), indent=2)

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from circlestream.common import GB, REPO, S3_PART_SIZES, digest, s3_etag_matches, source_ok, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
 from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm, worker, submit_fetch, fetch_specs, reconcile_fetch, fetch_records
 from circlestream.fastq import extract, materialize
-from circlestream.rules import Context, archive, cf_lines, convert_sra, copy_caller_evidence
+from circlestream.rules import Context, archive, cf_lines, convert_sra, copy_caller_evidence, library_depth
 from scripts.cresil_wgls_checked import execute, strict_call
 from types import SimpleNamespace
 
@@ -1025,6 +1025,17 @@ class PipelineTests(unittest.TestCase):
                  ("i", 3000, [(0, 1000, "+", "chr1", 1000, 2000), (1000, 3000, "+", "chr1", 1960, 3960)])]  # small overlap
         rows, _, ids = self.junctions(reads)
         self.assertEqual(rows, []); self.assertEqual(ids, [])
+
+    def test_library_depth_counts_unmapped_reads_from_input(self):
+        fai = self.root / "ref.fa.fai"; fai.write_text("chr\t200000\t5\t60\t61\npl\t10000\t9\t60\t61\n")
+        paf = self.root / "lib.paf"
+        paf.write_text("r1\t1000\t0\t1000\t+\tchr\t200000\t0\t1000\t1000\t1000\t60\ttp:A:P\n"
+                       "r2\t3000\t0\t3000\t+\tpl\t10000\t0\t3000\t3000\t3000\t60\ttp:A:P\n")
+        fa = self.root / "reads.fa"; fa.write_text(">r1\n" + "A" * 1000 + "\n>r2\n" + "A" * 3000 + "\n>u1\n" + "A" * 2000 + "\n>u2\n" + "A" * 2000 + "\n")
+        j = library_depth(paf, fai, self.root / "depth.tsv", fa)
+        self.assertEqual((j["reads_input"], j["reads_in_paf"], j["reads_mapped_primary"]), (4, 2, 2))
+        self.assertEqual((j["mapped_fraction"], j["aligned_base_fraction"], j["read_n50"]), (0.5, 0.5, 2000))
+        self.assertIn("pl\t10000\t3000\t0.30", (self.root / "depth.tsv").read_text())
 
     def test_cresil_trace_requires_spanning_entry_not_sub_unit_overlap(self):
         from scripts.cresil_trace import final_spans, span_matches

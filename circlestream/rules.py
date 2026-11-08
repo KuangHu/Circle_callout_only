@@ -291,8 +291,11 @@ def call(x):
             "candidate_count": sum(r["ctc"] == "True" for r in rows)})
 
 
-def library_depth(paf, fai, out_tsv):
+def library_depth(paf, fai, out_tsv, reads_fa=None):
     """Read-length and per-contig depth summary from the whole-library PAF (primary chains).
+
+    Unmapped reads never appear in a PAF, so input read counts, N50 and the mapped fractions
+    come from reads_fa (all prepared reads) when given.
 
     Per-contig depth against the BioSample's assembly is the data-side check that reads and
     assembly come from the same culture: a plasmid contig without reads (or extra coverage
@@ -315,14 +318,29 @@ def library_depth(paf, fai, out_tsv):
         h.write("contig\tlength\taligned_bases\tmean_depth\tdepth_vs_large_contig_median\n")
         for c in by_len:
             h.write(f"{c}\t{lengths[c]}\t{aligned[c]}\t{depth[c]:.2f}\t{(depth[c] / median if median else 0):.3f}\n")
-    ls = sorted(qlen.values(), reverse=True)
+    if reads_fa is not None:
+        ls, cur = [], -1
+        with reads_fa.open() as handle:
+            for line in handle:
+                if line.startswith(">"):
+                    if cur >= 0:
+                        ls.append(cur)
+                    cur = 0
+                else:
+                    cur += len(line.rstrip("\n"))
+        if cur >= 0:
+            ls.append(cur)
+        ls.sort(reverse=True)
+    else:
+        ls = sorted(qlen.values(), reverse=True)
     half, run, n50 = sum(ls) / 2, 0, 0
     for v in ls:
         run += v
         if run >= half:
             n50 = v; break
-    return {"reads_aligned_input": len(qlen), "reads_mapped_primary": len(mapped),
-            "mapped_fraction": round(len(mapped) / max(1, len(qlen)), 4), "read_n50": n50,
+    return {"reads_input": len(ls), "bases_input": sum(ls), "reads_in_paf": len(qlen), "reads_mapped_primary": len(mapped),
+            "mapped_fraction": round(len(mapped) / max(1, len(ls)), 4),
+            "aligned_base_fraction": round(sum(aligned.values()) / max(1, sum(ls)), 4), "read_n50": n50,
             "mean_read_length": round(sum(ls) / max(1, len(ls)), 1), "assembly_bp": total,
             "mean_depth_assembly": round(sum(aligned.values()) / max(1, total), 2),
             "median_depth_large_contigs": round(median, 2),
@@ -341,7 +359,8 @@ def ont_junctions(x):
         flags += ["--" + key.replace("_", "-"), str(value)]
     x.run([sys.executable, REPO / "scripts" / "ont_junctions.py", paf, x.ref, x.out / "ont_junctions.tsv",
            "--events", x.out / "ont_junction_events.tsv", "--support-ids", x.out / "ont_junction_ids.txt", *flags])
-    write_json(x.out / "ont_library.json", library_depth(paf, Path(str(x.ref) + ".fai"), x.out / "contig_depth.tsv"))
+    write_json(x.out / "ont_library.json", library_depth(paf, Path(str(x.ref) + ".fai"), x.out / "contig_depth.tsv",
+                                                             x.work / "prepared" / "reads.fa"))
     with (x.out / "ont_junction_ids.txt").open() as handle:
         ids = {l.strip() for l in handle if l.strip()}
     # Junction reads' alignments (incl. secondaries) are the classification basis; keep them.
