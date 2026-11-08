@@ -13,8 +13,12 @@ own trim.txt, to record WHERE a junction is lost, not to replace CReSIL:
                          breakpoints; CReSIL keeps only regions <= -mwindow (default 100 kb)
   3 read_covers_90pct    a region is kept only if one trimmed read segment covers >= 90% of it
   4 depth_minrsize       mean depth of all trimmed segments >= -depth and length >= -minrsize
-  5 in_final_graph       an eccDNA_final.txt entry overlaps the junction's unit
-  6 cyclic               that entry has ctc == True
+  5 in_final_graph       an eccDNA_final.txt entry spans the junction's unit: the entry's
+                         regions on this contig, coalesced across gaps <= --end-tol, give a
+                         span whose ends agree with the junction (see span_matches). Entries
+                         that only overlap the unit (e.g. a 1 kb cyclic sub-unit inside a 3 kb
+                         plasmid) do not pass; they are listed in cresil_partial_ids
+  6 cyclic               a spanning entry has ctc == True
 excluded_at = first step that fails (steps 2-4 fail if any region of the unit fails, since
 the cyclic graph then cannot close). Junctions: all whole_contig rows plus rows with
 support_ge3 == yes.
@@ -24,6 +28,43 @@ import bisect
 import collections
 import csv
 import re
+
+
+def final_spans(path, gap=100):
+    """eccDNA_final.txt -> [(contig, start0, end, id, cyclic)], one span per entry and contig
+    after coalescing that entry's regions across gaps <= gap (CReSIL often splits one unit)."""
+    spans = []
+    try:
+        rows = list(csv.DictReader(open(path), delimiter="\t"))
+    except FileNotFoundError:
+        return spans
+    for r in rows:
+        regs = collections.defaultdict(list)
+        for reg in r["merge_region"].split(","):
+            m = re.match(r"(.+):(\d+)-(\d+)_[+-]$", reg)
+            regs[m.group(1)].append((int(m.group(2)) - 1, int(m.group(3))))
+        for c, iv in regs.items():
+            iv.sort()
+            cur = list(iv[0])
+            for x, y in iv[1:]:
+                if x <= cur[1] + gap:
+                    cur[1] = max(cur[1], y)
+                else:
+                    spans.append((c, cur[0], cur[1], r["id"], r["ctc"] == "True")); cur = [x, y]
+            spans.append((c, cur[0], cur[1], r["id"], r["ctc"] == "True"))
+    return spans
+
+
+def span_matches(contig, start, end, mh, span, tol=50, frac=0.02):
+    """Same rule as compare_platforms: ends within max(tol, frac x length), or shifted
+    together along the junction's microhomology."""
+    if span[0] != contig:
+        return False
+    ds, de = span[1] - start, span[2] - end
+    lim = max(tol, frac * max(end - start, span[2] - span[1]))
+    if abs(ds) <= lim and abs(de) <= lim:
+        return True
+    return abs(ds - de) <= tol and abs(ds) <= mh + tol
 
 
 def main():
@@ -50,14 +91,7 @@ def main():
             allsegs[r["ref"]].append((s, e, int(r["strand"]), r["readid"]))
             if int(r["order"]) > 0:
                 sup[r["ref"]].append((s, e, int(r["strand"]), r["readid"]))
-    final = []
-    try:
-        for r in csv.DictReader(open(f"{a.cresil_out}/eccDNA_final.txt"), delimiter="\t"):
-            for reg in r["merge_region"].split(","):
-                m = re.match(r"(.+):(\d+)-(\d+)_[+-]$", reg)
-                final.append((m.group(1), int(m.group(2)) - 1, int(m.group(3)), r["id"], r["ctc"] == "True"))
-    except FileNotFoundError:
-        pass
+    final = final_spans(f"{a.cresil_out}/eccDNA_final.txt", a.end_tol)
 
     cov, bps, supsorted = {}, {}, {}
     for c in contigs:
@@ -115,7 +149,9 @@ def main():
         not90 = [p for p in ok_len if not covered90(p)]
         mean_depth = lambda p: (cov[c][p[1]] - cov[c][p[0]]) / max(1, p[1] - p[0])  # noqa: E731
         lowdepth = [p for p in ok_len if p not in not90 and mean_depth(p) < a.depth]
-        hits = [f for f in final if f[0] == c and min(f[2], end) - max(f[1], start) > 0.5 * min(f[2] - f[1], end - start)]
+        mh = int(t.get("microhomology_bp") or 0)
+        hits = [f for f in final if span_matches(c, start, end, mh, f)]
+        partial = [f for f in final if f not in hits and f[0] == c and min(f[2], end) - max(f[1], start) > 0]
         steps = [("trim_junction_reads", jreads > 0), ("region_length", not too_long), ("read_covers_90pct", not not90),
                  ("depth_minrsize", bool(pieces) and not lowdepth), ("in_final_graph", bool(hits)), ("cyclic", any(h[4] for h in hits))]
         excluded = next((name for name, ok in steps if not ok), "kept_cyclic")
@@ -125,10 +161,11 @@ def main():
                      "regions_over_mwindow": len(too_long), "max_region_bp": max((p[1] - p[0] for p in pieces), default=0),
                      "regions_not_90pct_covered": len(not90), "regions_low_depth_or_short": len(lowdepth),
                      "cresil_ids": ";".join(sorted({h[3] + ("(cyclic)" if h[4] else "") for h in hits})) or "none",
+                     "cresil_partial_ids": ";".join(sorted({f"{h[3]}{'(cyclic)' if h[4] else ''}:{h[1]}-{h[2]}" for h in partial})) or "none",
                      "excluded_at": excluded})
     cols = ["junction_id", "contig", "start", "end", "length", "location", "label", "independent_molecules",
             "trim_junction_reads", "regions", "gaps_below_minrsize", "regions_over_mwindow", "max_region_bp", "regions_not_90pct_covered",
-            "regions_low_depth_or_short", "cresil_ids", "excluded_at"]
+            "regions_low_depth_or_short", "cresil_ids", "cresil_partial_ids", "excluded_at"]
     with open(a.out, "w", newline="") as handle:
         w = csv.DictWriter(handle, fieldnames=cols, delimiter="\t", lineterminator="\n")
         w.writeheader(); w.writerows(rows)

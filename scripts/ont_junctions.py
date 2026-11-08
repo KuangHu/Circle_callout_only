@@ -26,7 +26,9 @@ Per event
                           unique alignment with an insertion of length X-Y (+/- 5% or
                           --tolerance) placed within [Y, X] (+/- --tolerance), that continues
                           >= --flank bp outside [Y, X], is a linear tandem molecule: counted in
-                          insertion_tandem_molecules and in tandem_flank_molecules.
+                          insertion_tandem_molecules and in tandem_flank_molecules. An
+                          insertion fitting several nearby junctions is credited to one only
+                          (most split-read events, then closest length): no double counting.
     outside_bp            bp of the segment reaching X (or starting at Y) aligned OUTSIDE
                           [Y, X): the same alignment continues from the unit into flanking
                           genome. unique_outside_bp counts it only on a unique segment; that
@@ -276,24 +278,41 @@ def main():
         l = loci.setdefault(key, {"raw": [], "members": [], "mh": 0})
         l["raw"].append((cid, s, e)); l["members"] += c["members"]; l["mh"] = max(l["mh"], left + right)
 
+    # Each insertion is evidence for ONE junction: when several nearby junctions could explain
+    # it (same tandem, slightly different split-read breakpoints), it goes to the one with the
+    # most split-read events, then the closest unit length, so molecules are never double counted.
+    owner = {}  # (contig, index in insertions[contig]) -> (rank key, jid)
+    ordered = sorted(loci.items())
+    for jid, (key, l) in enumerate(ordered, 1):
+        contig, start, end = key
+        L, unit = lengths[contig], end - start
+        if start <= o.edge and end >= L - o.edge:
+            continue
+        col = insertions.get(contig, [])
+        lo = bisect.bisect_left(col, (start - o.tolerance,))
+        for i in range(lo, bisect.bisect_right(col, (end + o.tolerance + 1,))):
+            pos, n, name, ts, te, uniq = col[i]
+            if uniq and abs(n - unit) <= max(o.tolerance, 0.05 * unit) and (ts <= start - o.flank or te >= end + o.flank):
+                rank = (-len(l["members"]), abs(n - unit), jid)
+                if (contig, i) not in owner or rank < owner[(contig, i)][0]:
+                    owner[(contig, i)] = (rank, jid)
+    owned = collections.defaultdict(list)
+    for (contig, i), (_, jid) in owner.items():
+        owned[jid].append(insertions[contig][i])
+
     rows, support, extra_events = [], set(), []
-    for jid, (key, l) in enumerate(sorted(loci.items()), 1):
+    for jid, (key, l) in enumerate(ordered, 1):
         contig, start, end = key
         L = lengths[contig]
         members = [events[m] for m in l["members"]]
         for m in members:
             m["junction_id"] = jid
-        unit = end - start
-        ins_ev = []
-        if not (start <= o.edge and end >= L - o.edge):
-            col = insertions.get(contig, [])
-            for pos, n, name, ts, te, uniq in col[bisect.bisect_left(col, (start - o.tolerance,)):bisect.bisect_right(col, (end + o.tolerance + 1,))]:
-                if uniq and abs(n - unit) <= max(o.tolerance, 0.05 * unit) and (ts <= start - o.flank or te >= end + o.flank):
-                    ins_ev.append({"read": name, "contig": contig, "strand": ".", "evidence": "insertion",
-                                   "raw_start": pos, "raw_end": pos + n, "start": start, "end": end,
-                                   "anchor_a": pos - ts, "anchor_b": te - pos, "unique_a": True, "unique_b": True,
-                                   "outside_bp": max(start - ts, te - end, 0), "unique_outside_bp": max(start - ts, te - end, 0),
-                                   "overlap_bp": 0, "molecule_start": ts, "molecule_end": te, "junction_id": jid, "cluster_raw": ""})
+        ins_ev = [{"read": name, "contig": contig, "strand": ".", "evidence": "insertion",
+                   "raw_start": pos, "raw_end": pos + n, "start": start, "end": end,
+                   "anchor_a": pos - ts, "anchor_b": te - pos, "unique_a": True, "unique_b": True,
+                   "outside_bp": max(start - ts, te - end, 0), "unique_outside_bp": max(start - ts, te - end, 0),
+                   "overlap_bp": 0, "molecule_start": ts, "molecule_end": te, "junction_id": jid, "cluster_raw": ""}
+                  for pos, n, name, ts, te, _ in sorted(owned.get(jid, []))]
         ins_mols = molecules(ins_ev, o.dup_tolerance)
         extra_events.extend(ins_ev)
         mols = molecules(members, o.dup_tolerance)

@@ -926,6 +926,26 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue({"ins0", "ins1", "ins2"} <= set(ids))
         self.assertEqual(sum(e["evidence"] == "insertion" for e in events), 3)
 
+    def test_ont_junction_insertion_is_credited_to_one_nearby_junction_only(self):
+        # A second, weaker junction 70 bp away (2 split reads) also fits the 2 kb insertions; they
+        # must count once, for the junction with more split-read events.
+        reads = self.long_background() + self.circle_reads(4)
+        for i in range(2):
+            cut = 10600 + 37 * i
+            reads.append((f"w{i}", 1800, [(0, 12000 - cut, "+", "chr1", cut, 12000), (12000 - cut, 1800, "+", "chr1", 10070, 10070 + 1800 - (12000 - cut))]))
+        paf_extra = []
+        for i in range(3):
+            ts, te = 8000 - 37 * i, 14000 + 37 * i
+            ql = te - ts + 2000
+            paf_extra.append("\t".join(map(str, [f"ins{i}", ql, 0, ql, "+", "chr1", 30000, ts, te, te - ts, ql, 60,
+                                                  "tp:A:P", f"AS:i:{te - ts}", f"cg:Z:{12000 - ts}M2000I{te - 12000}M"])))
+        rows, events, _ = self.junctions(reads, extra_paf=paf_extra)
+        by = {(r["start"], r["end"]): r for r in rows}
+        self.assertEqual(set(by), {("10000", "12000"), ("10070", "12000")})
+        self.assertEqual(by[("10000", "12000")]["insertion_tandem_molecules"], "3")
+        self.assertEqual((by[("10070", "12000")]["insertion_tandem_molecules"], by[("10070", "12000")]["independent_molecules"]), ("0", "2"))
+        self.assertEqual(sum(e["evidence"] == "insertion" for e in events), 3)
+
     def test_ont_junction_single_flank_read_is_not_tandem_and_overlap_proves_nothing(self):
         flank = [("x0", 5000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000)])]
         twice = [("m0", 3800, [(0, 1500, "+", "chr1", 10500, 12000), (1500, 3500, "+", "chr1", 10000, 12000),
@@ -1005,6 +1025,22 @@ class PipelineTests(unittest.TestCase):
                  ("i", 3000, [(0, 1000, "+", "chr1", 1000, 2000), (1000, 3000, "+", "chr1", 1960, 3960)])]  # small overlap
         rows, _, ids = self.junctions(reads)
         self.assertEqual(rows, []); self.assertEqual(ids, [])
+
+    def test_cresil_trace_requires_spanning_entry_not_sub_unit_overlap(self):
+        from scripts.cresil_trace import final_spans, span_matches
+        p = self.root / "eccDNA_final.txt"
+        p.write_text("id\tmerge_region\tmerge_len\tnum_region\tctc\n"
+                     "ec1\tpl:7-996_-\t990\t1\tTrue\n"                                   # cyclic sub-unit of a 3066 bp plasmid
+                     "ec2\tchr:2882024-2885212_+,chr:2885213-2900183_+\t18160\t2\tFalse\n"  # one unit split in two regions
+                     "ec3\tpl2:3001-5000_+,pl2:1-3000_+\t5000\t2\tTrue\n")                 # closure written as two arcs
+        spans = final_spans(p, 100)
+        self.assertIn(("chr", 2882023, 2900183, "ec2", False), spans)
+        self.assertIn(("pl2", 0, 5000, "ec3", True), spans)
+        hit = lambda c, s, e: [x[3] for x in spans if span_matches(c, s, e, 0, x)]  # noqa: E731
+        self.assertEqual(hit("pl", 0, 3066), [])             # overlap with a sub-unit is not agreement
+        self.assertEqual(hit("chr", 2882000, 2900186), ["ec2"])
+        self.assertEqual(hit("chr", 2850683, 2900186), [])   # same end, different start
+        self.assertEqual(hit("pl2", 0, 5000), ["ec3"])
 
     def test_config_rejects_unknown_ont_junction_key(self):
         c = dict(self.c, caller=dict(self.c["caller"], ont_junction={"min_reads": 3, "bogus": 1}))

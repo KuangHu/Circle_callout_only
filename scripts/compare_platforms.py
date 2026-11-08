@@ -26,9 +26,12 @@ import collections
 import csv
 import io
 import json
-import re
+import sys
 import tarfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cresil_trace import final_spans, span_matches  # noqa: E402  same matching rule as the tracer
 
 THRESHOLDS = (1, 2, 3, 5, 10)
 
@@ -62,13 +65,7 @@ def tsv(text):
 
 
 def matches(j, c, tol, frac):
-    if j["contig"] != c[0]:
-        return False
-    ds, de = c[1] - int(j["start"]), c[2] - int(j["end"])
-    lim = max(tol, frac * max(int(j["length"]), c[2] - c[1]))
-    if abs(ds) <= lim and abs(de) <= lim:
-        return True
-    return abs(ds - de) <= tol and abs(ds) <= int(j.get("microhomology_bp") or 0) + tol
+    return span_matches(j["contig"], int(j["start"]), int(j["end"]), int(j.get("microhomology_bp") or 0), c, tol, frac)
 
 
 def main():
@@ -88,10 +85,9 @@ def main():
             per.append({"sample": sid, "status": "not a v3 ONT archive"}); continue
         junc, trace = tsv(m["j"]), {r["junction_id"]: r for r in tsv(m.get("t"))}
         cres = []
-        for r in tsv(m.get("e")):
-            for reg in r["merge_region"].split(","):
-                mm = re.match(r"(.+):(\d+)-(\d+)_[+-]$", reg)
-                cres.append((mm.group(1), int(mm.group(2)) - 1, int(mm.group(3)), r["id"], r["ctc"] == "True"))
+        if "e" in m:
+            ef = out / ".eccDNA_final.tmp"
+            ef.write_text(m["e"]); cres = final_spans(ef, 100); ef.unlink()
         icalls = None
         if sid in ill:
             im = read_members(ill[sid], {"jt": "sample-ref.microDNA-JT.txt"})
@@ -101,9 +97,14 @@ def main():
             hit_c = [c for c in cres if matches(j, c, a.tol, a.frac)]
             hit_i = [c for c in (icalls or []) if matches(j, c, a.tol, a.frac)]
             t = trace.get(j["junction_id"], {})
+            excl = t.get("excluded_at", "")
+            if excl in ("kept_cyclic", "cyclic") and not hit_c:
+                excl = "in_final_graph"  # archives traced before the spanning rule: overlap only
+            if excl == "kept_cyclic" and not any(c[4] for c in hit_c):
+                excl = "cyclic"
             rows.append(dict(j, sample=sid,
                              cresil_match=";".join(sorted({c[3] + ("(cyclic)" if c[4] else "") for c in hit_c})) or "none",
-                             cresil_excluded_at=t.get("excluded_at", ""),
+                             cresil_excluded_at=excl,
                              illumina_split_reads="" if icalls is None else max([c[3] for c in hit_i], default=0)))
         sr = [r for r in rows if r["sample"] == sid]
         per.append({"sample": sid, "status": "ok", "illumina": "yes" if icalls is not None else "no",
