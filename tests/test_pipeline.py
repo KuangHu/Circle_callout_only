@@ -846,5 +846,71 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(greps), 5)
         self.assertTrue(all(WORD_GREP.fullmatch(l) for l in greps))
 
+    def junctions(self, paf_rows, contigs={"chr1": 30000, "pl": 3000}, extra=()):
+        paf = self.root / "j.paf"; fai = self.root / "j.fai"; out = self.root / "j.tsv"; ids = self.root / "j.ids"
+        lines = []
+        for read, qlen, segs in paf_rows:
+            for qs, qe, strand, contig, ts, te in segs:
+                lines.append("\t".join(map(str, [read, qlen, qs, qe, strand, contig, contigs[contig], ts, te, te - ts, te - ts, 60, "tp:A:P"])))
+        paf.write_text("\n".join(lines) + "\n")
+        fai.write_text("".join(f"{k}\t{v}\t0\t60\t61\n" for k, v in contigs.items()))
+        r = subprocess.run([os.sys.executable, str(REPO / "scripts" / "ont_junctions.py"), str(paf), str(fai), str(out),
+                            "--support-ids", str(ids), *extra], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        import csv as _csv
+        return list(_csv.DictReader(out.open(), delimiter="\t")), ids.read_text().split()
+
+    def long_background(self, n=200, qlen=20000):
+        # Library reads long enough that a tandem copy of a 2 kb unit would show beyond-unit reads.
+        return [(f"bg{i}", qlen, [(0, qlen, "+", "chr1", 5000, 5000 + qlen)]) for i in range(n)]
+
+    def test_ont_junction_circle_supported_plus_and_minus(self):
+        reads = self.long_background()
+        for i in range(10):  # linearized 2 kb circle [10000,12000): read <= unit, crosses the junction
+            cut = 10500 + 50 * i
+            segs = [(0, 12000 - cut, "+", "chr1", cut, 12000), (12000 - cut, 1900, "+", "chr1", 10000, 10000 + 1900 - (12000 - cut))]
+            if i % 2:  # same molecule read from the other strand: reversed read order, mirrored
+                segs = [(0, 1900 - (12000 - cut), "-", "chr1", 10000, 10000 + 1900 - (12000 - cut)), (1900 - (12000 - cut), 1900, "-", "chr1", cut, 12000)]
+            reads.append((f"c{i}", 1900, segs))
+        rows, ids = self.junctions(reads)
+        self.assertEqual(len(rows), 1); r = rows[0]
+        self.assertEqual((r["contig"], int(r["start"]), int(r["end"])), ("chr1", 10000, 12000))
+        self.assertEqual(r["junction_reads"], "10"); self.assertEqual(r["beyond_unit_reads"], "0")
+        self.assertEqual(r["label"], "circle_supported")
+        self.assertEqual(sorted(ids), sorted(f"c{i}" for i in range(10)))
+
+    def test_ont_junction_tandem_detected_by_beyond_unit_reads(self):
+        reads = self.long_background()
+        for i in range(6):  # genome ...L [10000,12000) [10000,12000) R...: long reads run from L through both copies
+            reads.append((f"t{i}", 5000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000)]))
+        rows, _ = self.junctions(reads)
+        self.assertEqual(rows[0]["label"], "tandem_or_mixed"); self.assertEqual(rows[0]["beyond_unit_reads"], "6")
+
+    def test_ont_junction_short_library_is_ambiguous_and_replicon_separate(self):
+        reads = [(f"bg{i}", 1500, [(0, 1500, "+", "chr1", 5000, 6500)]) for i in range(200)]  # short library
+        for i in range(5):
+            reads.append((f"c{i}", 1500, [(0, 800, "+", "chr1", 11200, 12000), (800, 1500, "+", "chr1", 10000, 10700)]))
+        for i in range(4):  # end->start of a circular 3 kb contig
+            reads.append((f"p{i}", 1000, [(0, 500, "+", "pl", 2500 + i, 3000), (500, 1000, "+", "pl", 3 + i, 500)]))
+        rows, _ = self.junctions(reads)
+        labels = {(r["contig"], r["start"], r["end"]): r["label"] for r in rows}
+        self.assertEqual(labels[("chr1", "10000", "12000")], "junction_ambiguous")
+        self.assertEqual(labels[("pl", "0", "3000")], "replicon_junction")
+        self.assertEqual(len(rows), 2)
+
+    def test_ont_junction_ignores_indels_and_other_contigs(self):
+        reads = [("d", 3000, [(0, 1000, "+", "chr1", 1000, 2000), (1000, 3000, "+", "chr1", 2500, 4500)]),  # deletion: jump forward
+                 ("o", 3000, [(0, 1000, "+", "chr1", 1000, 2000), (1000, 3000, "+", "pl", 0, 2000)]),       # translocation
+                 ("s", 3000, [(0, 1000, "+", "chr1", 1000, 2000), (1000, 3000, "-", "chr1", 500, 1500)]),   # inversion
+                 ("i", 3000, [(0, 1000, "+", "chr1", 1000, 2000), (1000, 3000, "+", "chr1", 1960, 3960)])]  # small overlap
+        rows, ids = self.junctions(reads)
+        self.assertEqual(rows, []); self.assertEqual(ids, [])
+
+    def test_config_rejects_unknown_ont_junction_key(self):
+        c = dict(self.c, caller=dict(self.c["caller"], ont_junction={"min_reads": 3, "bogus": 1}))
+        p = self.root / "cfg.json"; write_json(p, c)
+        with self.assertRaisesRegex(ValueError, "ont_junction"):
+            load_config(p)
+
 
 if __name__=="__main__": unittest.main()

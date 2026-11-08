@@ -274,8 +274,30 @@ def call(x):
             rows = list(reader)
         if any(r["ctc"] not in ("True", "False") for r in rows):
             raise ValueError("Unexpected CReSIL cyclic flag")
+        junctions = ont_junctions(x)
         write_json(x.state / "calls.json", {"candidate_count": sum(r["ctc"] == "True" for r in rows),
-            "all_graph_count": len(rows), "classification": "cyclic_graph_candidate_not_topology_proof", "caller": "CReSIL"})
+            "all_graph_count": len(rows), "classification": "cyclic_graph_candidate_not_topology_proof", "caller": "CReSIL",
+            "cresil_mode": p["cresil_mode"], "ont_junctions": junctions})
+
+
+def ont_junctions(x):
+    """Direct long-read junction counts (scripts/ont_junctions.py), independent of CReSIL."""
+    q = shlex.quote
+    paf = x.out / "junctions.paf"
+    x.shell(f"minimap2 -c --secondary=no -x map-ont -t {max(1, x.cpus - 1)} {q(str(x.ref))} "
+            f"{q(str(x.work / 'prepared' / 'reads.fa'))} > {q(str(paf))}")
+    flags = []
+    for key, value in x.c["caller"].get("ont_junction", {}).items():
+        flags += ["--" + key.replace("_", "-"), str(value)]
+    x.run([sys.executable, REPO / "scripts" / "ont_junctions.py", paf, str(x.ref) + ".fai", x.out / "ont_junctions.tsv",
+           "--support-ids", x.out / "ont_junction_ids.txt", *flags])
+    with (x.out / "ont_junctions.tsv").open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    counts = {}
+    for r in rows:
+        counts[r["label"]] = counts.get(r["label"], 0) + 1
+    return {"clusters": len(rows), "by_label": counts,
+            "circle_supported": counts.get("circle_supported", 0), "note": "evidence categories, not topology proof"}
 
 
 def copy_caller_evidence(out, ev, platform, wanted):
@@ -295,7 +317,8 @@ def copy_caller_evidence(out, ev, platform, wanted):
             dest = ev / rel
         else:
             keep = rel.as_posix() in {
-                "eccDNA_final.txt", "no_candidates.json", "cresil_run/subGraphs.summary.txt"}
+                "eccDNA_final.txt", "no_candidates.json", "cresil_run/subGraphs.summary.txt",
+                "ont_junctions.tsv"}
             keep = keep or (len(rel.parts) == 4 and rel.parts[:2] == ("cresil_run", "assemGraph")
                             and p.name in {"final_reads.fa", "reference_regions.fa"})
             dest = ev / "cresil" / rel
@@ -353,6 +376,9 @@ def evidence(x):
                         # Upstream format: graphID_originalReadID_queryStart_queryEnd.
                         header = line[1:].split()[0]
                         wanted.add(header.split("_",1)[1].rsplit("_",2)[0])
+        junction_ids = x.out / "ont_junction_ids.txt"
+        if junction_ids.is_file():  # reads behind every junction cluster, whatever its label
+            wanted.update(l.strip() for l in junction_ids.open() if l.strip())
         (ev / "read_ids.txt").write_text("".join(n+"\n" for n in sorted(wanted)))
     copy_caller_evidence(x.out, ev, x.s["platform"], wanted)
     counts = extract(x.inputs, wanted, ev, x.s["platform"])

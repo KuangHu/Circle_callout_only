@@ -56,6 +56,7 @@ python scripts/check_dag.py
 
 在管理员允许联网安装软件的节点执行安装。安装脚本创建三个独立 conda environments；已存在的环境不会自动覆盖。使用其他环境名时同步修改 config 的 command prefixes。
 
+- ONT 直接 junction 计数（`scripts/ont_junctions.py`，独立于 CReSIL）：同一 read 相邻两段比对在同一 contig、同一链上“回跳”即一次 junction，候选环为 [Y, X)。环在测序前必然被打开，所以单个环来源的 read 不会超出一个单位；tandem 复制（Y..X Y..X）在 read 长于单位时会出现越过单位的 read（侧翼序列或同一 read 两段覆盖相同碱基）。标签：`replicon_junction`（整个 contig 首尾，质粒/闭合染色体）、`tandem_or_mixed`、`circle_supported`（≥min_reads 条 junction read，没有越界 read，且按本文库读长分布若是 tandem 应出现 ≥3 条越界 read）、`junction_ambiguous`（读长不足以区分，与短读长相同的歧义）、`low_support`。均为证据类别，不是拓扑证明。阳性对照 DRR393831：CReSIL depth 模式 0 call（只取深度高于本 contig 平均的区域，整条质粒深度均匀，永远不满足）；linkage 模式检出 3 kb 质粒为环；junction 计数检出全部 6 个 replicon 首尾 junction。参数在 `caller.ont_junction`（可选）。
 - Circle_finder 固定到 `3eb333db2ea6277dde36cbf640be9afeb710c717`；原始 MIT 源码和许可证在 `third_party/`。上游脚本不修改；适配层（`circlestream/rules.py`）只把 5 行 `grep -w -Ff ids table` 换成 `scripts/wordgrep.py`，按 GNU grep `-w -F`（C locale）语义逐字节等价地筛选，但避开 GNU grep 在大量互为前缀的 read ID 下的慢路径（单步曾达 2 小时）。空模式或含 tab 的模式交回 grep 本身处理。设置 `CS_WORDGREP_VERIFY=1` 会同时运行 GNU grep 并在任何差异时失败（仅用于验证）。
 - CReSIL 固定到 `78356affa6adca6a41ea297c3d7d93f5ecb5ae6a`，沿用其环境文件，安装时 `pip --no-deps`。
 - conda 求解后的完整环境清单写入 `vendor/*.explicit.txt`。安装需要网络，compute jobs 不联网安装软件。

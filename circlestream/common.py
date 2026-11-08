@@ -158,6 +158,11 @@ def load_config(path):
         raise ValueError("CReSIL has internal minimum worker counts: allocate at least 4 CPUs")
     if c["caller"]["cresil_mode"] not in ("depth", "linkage"):
         raise ValueError("cresil_mode must be depth or linkage")
+    oj = c["caller"].get("ont_junction", {})
+    allowed = {"min_mapq", "min_aln", "max_qgap", "min_circle", "tolerance", "flank", "min_reads",
+               "replicon_slack", "min_expected_beyond"}
+    if not isinstance(oj, dict) or set(oj) - allowed or any(not isinstance(v, (int, float)) or v < 0 for v in oj.values()):
+        raise ValueError(f"caller.ont_junction must map {sorted(allowed)} to non-negative numbers")
     if c.get("download_mode", "dtn") not in ("dtn", "slurm"):
         raise ValueError("download_mode must be dtn (DTN downloader) or slurm (1-CPU fetch jobs + node-local work)")
     if c.get("reference_store"):
