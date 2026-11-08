@@ -291,6 +291,44 @@ def call(x):
             "candidate_count": sum(r["ctc"] == "True" for r in rows)})
 
 
+def library_depth(paf, fai, out_tsv):
+    """Read-length and per-contig depth summary from the whole-library PAF (primary chains).
+
+    Per-contig depth against the BioSample's assembly is the data-side check that reads and
+    assembly come from the same culture: a plasmid contig without reads (or extra coverage
+    elsewhere) flags a different isolate / DNA prep."""
+    lengths = {l.split("\t")[0]: int(l.split("\t")[1]) for l in fai.read_text().splitlines() if l.strip()}
+    aligned = collections.Counter()
+    qlen, mapped = {}, set()
+    with paf.open() as handle:
+        for line in handle:
+            f = line.split("\t", 13)
+            qlen[f[0]] = int(f[1])
+            if "tp:A:P" in line and int(f[11]) >= 1:
+                aligned[f[5]] += int(f[8]) - int(f[7]); mapped.add(f[0])
+    total = sum(lengths.values())
+    depth = {c: aligned[c] / L for c, L in lengths.items()}
+    by_len = sorted(lengths, key=lambda c: -lengths[c])
+    med = sorted(depth[c] for c in by_len if lengths[c] >= 100000) or sorted(depth.values())
+    median = med[len(med) // 2] if med else 0.0
+    with out_tsv.open("w") as h:
+        h.write("contig\tlength\taligned_bases\tmean_depth\tdepth_vs_large_contig_median\n")
+        for c in by_len:
+            h.write(f"{c}\t{lengths[c]}\t{aligned[c]}\t{depth[c]:.2f}\t{(depth[c] / median if median else 0):.3f}\n")
+    ls = sorted(qlen.values(), reverse=True)
+    half, run, n50 = sum(ls) / 2, 0, 0
+    for v in ls:
+        run += v
+        if run >= half:
+            n50 = v; break
+    return {"reads_aligned_input": len(qlen), "reads_mapped_primary": len(mapped),
+            "mapped_fraction": round(len(mapped) / max(1, len(qlen)), 4), "read_n50": n50,
+            "mean_read_length": round(sum(ls) / max(1, len(ls)), 1), "assembly_bp": total,
+            "mean_depth_assembly": round(sum(aligned.values()) / max(1, total), 2),
+            "median_depth_large_contigs": round(median, 2),
+            "contigs_below_0.1x_median_ge5kb": sum(1 for c in lengths if lengths[c] >= 5000 and median and depth[c] < 0.1 * median)}
+
+
 def ont_junctions(x):
     """Direct long-read junction counts (scripts/ont_junctions.py), independent of CReSIL."""
     q = shlex.quote
@@ -303,6 +341,7 @@ def ont_junctions(x):
         flags += ["--" + key.replace("_", "-"), str(value)]
     x.run([sys.executable, REPO / "scripts" / "ont_junctions.py", paf, x.ref, x.out / "ont_junctions.tsv",
            "--events", x.out / "ont_junction_events.tsv", "--support-ids", x.out / "ont_junction_ids.txt", *flags])
+    write_json(x.out / "ont_library.json", library_depth(paf, Path(str(x.ref) + ".fai"), x.out / "contig_depth.tsv"))
     with (x.out / "ont_junction_ids.txt").open() as handle:
         ids = {l.strip() for l in handle if l.strip()}
     # Junction reads' alignments (incl. secondaries) are the classification basis; keep them.
@@ -342,7 +381,7 @@ def copy_caller_evidence(out, ev, platform, wanted):
             keep = rel.as_posix() in {
                 "eccDNA_final.txt", "no_candidates.json", "cresil_run/subGraphs.summary.txt",
                 "ont_junctions.tsv", "ont_junction_events.tsv", "ont_junction_ids.txt",
-                "ont_junctions.support.paf.gz", "cresil_trace.tsv"}
+                "ont_junctions.support.paf.gz", "cresil_trace.tsv", "ont_library.json", "contig_depth.tsv"}
             # final_reads.fa holds read sequence for EVERY graph (whole replicons in deep samples:
             # gigabytes); keep graph -> read ID tables instead (graph_reads.tsv.gz, below).
             keep = keep or (len(rel.parts) == 4 and rel.parts[:2] == ("cresil_run", "assemGraph")

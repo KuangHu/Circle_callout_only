@@ -21,6 +21,12 @@ Per event
     anchor_a / anchor_b   aligned reference bp of the segments before / after the junction
     unique_a / unique_b   mapq >= --min-mapq and no secondary alignment of the same read
                           bases scoring >= --repeat-score-frac of the primary
+    insertion evidence    minimap2 often aligns a long read through a tandem duplication as ONE
+                          alignment carrying the extra copy as a CIGAR insertion. A primary,
+                          unique alignment with an insertion of length X-Y (+/- 5% or
+                          --tolerance) placed within [Y, X] (+/- --tolerance), that continues
+                          >= --flank bp outside [Y, X], is a linear tandem molecule: counted in
+                          insertion_tandem_molecules and in tandem_flank_molecules.
     outside_bp            bp of the segment reaching X (or starting at Y) aligned OUTSIDE
                           [Y, X): the same alignment continues from the unit into flanking
                           genome. unique_outside_bp counts it only on a unique segment; that
@@ -38,7 +44,7 @@ Clusters and equivalent breakpoints
     stay in raw_clusters, and every event keeps its raw coordinates.
 
 Independent support
-    junction_reads          distinct read IDs
+    junction_reads          distinct read IDs (split-read events + matching insertion reads)
     independent_molecules   reads grouped when the reference positions where they start and
                             stop (the molecule's cut ends) agree within --dup-tolerance bp,
                             strand ignored: duplex template/complement pairs and duplicate
@@ -64,13 +70,16 @@ import argparse
 import bisect
 import collections
 import csv
+import re
 import sys
 
 COLS = ["junction_id", "contig", "start", "end", "length", "contig_length", "location", "raw_clusters",
-        "microhomology_bp", "junction_reads", "junction_events", "independent_molecules", "anchored_molecules",
-        "repeat_ambiguous_molecules", "tandem_flank_molecules", "multipass_molecules", "expected_flank_if_tandem",
+        "microhomology_bp", "junction_reads", "junction_events", "independent_molecules", "split_molecules",
+        "anchored_molecules",
+        "repeat_ambiguous_molecules", "tandem_flank_molecules", "insertion_tandem_molecules", "multipass_molecules",
+        "expected_flank_if_tandem",
         "label", "circle_compatible", "support_ge3"]
-EVENT_COLS = ["read", "junction_id", "cluster_raw", "contig", "strand", "raw_start", "raw_end", "start", "end",
+EVENT_COLS = ["read", "evidence", "junction_id", "cluster_raw", "contig", "strand", "raw_start", "raw_end", "start", "end",
               "anchor_a", "anchor_b", "mapq_a", "mapq_b", "unique_a", "unique_b", "outside_bp",
               "unique_outside_bp", "overlap_bp", "molecule_start", "molecule_end"]
 
@@ -97,7 +106,10 @@ def tag(fields, key, default=None):
     return default
 
 
-def read_paf(path, min_aln):
+CIGAR = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def read_paf(path, min_aln, insertion_min=0):
     """{read: [primaries, secondaries, {query lengths}]}; primaries include supplementary (tp:A:P)."""
     reads = collections.defaultdict(lambda: ([], [], set()))
     with open(path) as handle:
@@ -108,7 +120,16 @@ def read_paf(path, min_aln):
             tp = tag(f[12:], "tp:A:", "P")
             ts, te = int(f[7]), int(f[8])
             seg = {"qs": int(f[2]), "qe": int(f[3]), "contig": f[5], "ts": ts, "te": te, "strand": f[4],
-                   "mapq": int(f[11]), "score": int(tag(f[12:], "AS:i:", tag(f[12:], "ms:i:", f[9])))}
+                   "mapq": int(f[11]), "score": int(tag(f[12:], "AS:i:", tag(f[12:], "ms:i:", f[9]))),
+                   "ins": []}
+            if tp == "P" and insertion_min:
+                pos = ts
+                for n, op in CIGAR.findall(tag(f[12:], "cg:Z:", "")):
+                    n = int(n)
+                    if op in "MDN=X":
+                        pos += n
+                    elif op == "I" and n >= insertion_min:
+                        seg["ins"].append((pos, n))
             entry = reads[f[0]]
             entry[2].add(int(f[1]))
             if tp == "P" and te - ts >= min_aln:
@@ -223,7 +244,7 @@ def main():
 
     seqs = read_fasta(o.ref)
     lengths = {k: len(v) for k, v in seqs.items()}
-    reads = read_paf(o.paf, o.min_aln)
+    reads = read_paf(o.paf, o.min_aln, insertion_min=o.min_circle)
     read_lengths = sorted(max(q) for _, _, q in reads.values() if q)
     dup_names = sum(1 for _, _, q in reads.values() if len(q) > 1)
 
@@ -236,6 +257,14 @@ def main():
                 e["start"], e["end"] = 0, L     # end -> start of a whole contig: one closure per replicon
             events.append(e)
 
+    insertions = collections.defaultdict(list)  # contig -> sorted [(pos, len, read, ts, te, unique)]
+    for name, (prim, sec, _) in reads.items():
+        for seg in prim:
+            for pos, n in seg["ins"]:
+                insertions[seg["contig"]].append((pos, n, name, seg["ts"], seg["te"],
+                                                  is_unique(seg, sec, o.min_mapq, o.repeat_score_frac)))
+    for v in insertions.values():
+        v.sort()
     loci = {}
     for cid, c in enumerate(cluster(events, o.tolerance), 1):
         seq, L = seqs[c["contig"]], lengths[c["contig"]]
@@ -247,20 +276,35 @@ def main():
         l = loci.setdefault(key, {"raw": [], "members": [], "mh": 0})
         l["raw"].append((cid, s, e)); l["members"] += c["members"]; l["mh"] = max(l["mh"], left + right)
 
-    rows, support = [], set()
+    rows, support, extra_events = [], set(), []
     for jid, (key, l) in enumerate(sorted(loci.items()), 1):
         contig, start, end = key
         L = lengths[contig]
         members = [events[m] for m in l["members"]]
         for m in members:
             m["junction_id"] = jid
+        unit = end - start
+        ins_ev = []
+        if not (start <= o.edge and end >= L - o.edge):
+            col = insertions.get(contig, [])
+            for pos, n, name, ts, te, uniq in col[bisect.bisect_left(col, (start - o.tolerance,)):bisect.bisect_right(col, (end + o.tolerance + 1,))]:
+                if uniq and abs(n - unit) <= max(o.tolerance, 0.05 * unit) and (ts <= start - o.flank or te >= end + o.flank):
+                    ins_ev.append({"read": name, "contig": contig, "strand": ".", "evidence": "insertion",
+                                   "raw_start": pos, "raw_end": pos + n, "start": start, "end": end,
+                                   "anchor_a": pos - ts, "anchor_b": te - pos, "unique_a": True, "unique_b": True,
+                                   "outside_bp": max(start - ts, te - end, 0), "unique_outside_bp": max(start - ts, te - end, 0),
+                                   "overlap_bp": 0, "molecule_start": ts, "molecule_end": te, "junction_id": jid, "cluster_raw": ""})
+        ins_mols = molecules(ins_ev, o.dup_tolerance)
+        extra_events.extend(ins_ev)
         mols = molecules(members, o.dup_tolerance)
+        all_mols = molecules(members + ins_ev, o.dup_tolerance)
         anchored = [g for g in mols if any(m["unique_a"] and m["unique_b"] and min(m["anchor_a"], m["anchor_b"]) >= o.min_anchor for m in g)]
-        tandem = [g for g in mols if any(m["unique_outside_bp"] >= o.flank for m in g)]
+        split_tandem = [g for g in mols if any(m["unique_outside_bp"] >= o.flank for m in g)]
+        tandem = molecules([g[0] for g in split_tandem] + [g[0] for g in ins_mols], o.dup_tolerance)
         repeat = [g for g in mols if all(not (m["unique_a"] and m["unique_b"]) for m in g)]
         multipass = sum(1 for g in mols if len({m["read"] for m in g}) < len(g) or any(m["overlap_bp"] > o.flank for m in g))
         need = (end - start) + 2 * o.flank
-        expected = len(mols) * (len(read_lengths) - bisect.bisect_left(read_lengths, need)) / max(1, len(read_lengths))
+        expected = len(all_mols) * (len(read_lengths) - bisect.bisect_left(read_lengths, need)) / max(1, len(read_lengths))
         if start <= o.edge and end >= L - o.edge:
             location = "whole_contig"
         elif start <= o.edge or end >= L - o.edge:
@@ -279,17 +323,19 @@ def main():
             compatible = "yes"
         else:
             compatible = "na"
-        names = sorted({m["read"] for m in members})
+        names = sorted({m["read"] for m in members} | {m["read"] for m in ins_ev})
         support.update(names)
         rows.append({"junction_id": jid, "contig": contig, "start": start, "end": end, "length": end - start,
                      "contig_length": L, "location": location,
                      "raw_clusters": ";".join(f"{cid}:{s}-{e}" for cid, s, e in l["raw"]),
                      "microhomology_bp": l["mh"], "junction_reads": len(names), "junction_events": len(members),
-                     "independent_molecules": len(mols), "anchored_molecules": len(anchored),
+                     "independent_molecules": len(all_mols), "split_molecules": len(mols),
+                     "anchored_molecules": len(anchored),
                      "repeat_ambiguous_molecules": len(repeat), "tandem_flank_molecules": len(tandem),
+                     "insertion_tandem_molecules": len(ins_mols),
                      "multipass_molecules": multipass, "expected_flank_if_tandem": round(expected, 2),
                      "label": label, "circle_compatible": compatible,
-                     "support_ge3": "yes" if len(mols) >= 3 else "no"})
+                     "support_ge3": "yes" if len(all_mols) >= 3 else "no"})
     rows.sort(key=lambda r: (-r["independent_molecules"], r["contig"], r["start"]))
     with open(o.out, "w", newline="") as handle:
         w = csv.DictWriter(handle, fieldnames=COLS, delimiter="\t", lineterminator="\n")
@@ -297,7 +343,9 @@ def main():
     if o.events:
         with open(o.events, "w", newline="") as handle:
             w = csv.DictWriter(handle, fieldnames=EVENT_COLS, delimiter="\t", lineterminator="\n", extrasaction="ignore")
-            w.writeheader(); w.writerows(sorted(events, key=lambda e: (e["junction_id"], e["read"])))
+            for e in events:
+                e.setdefault("evidence", "split")
+            w.writeheader(); w.writerows(sorted(events + extra_events, key=lambda e: (e["junction_id"], e["evidence"], e["read"])))
     if o.support_ids:
         with open(o.support_ids, "w") as handle:
             handle.writelines(r + "\n" for r in sorted(support))

@@ -6,11 +6,11 @@
 
 Re-implements the region steps of CReSIL 1.x linkage mode (identify_wgls.py) on CReSIL's
 own trim.txt, to record WHERE a junction is lost, not to replace CReSIL:
-  1 trim_junction_reads  reads kept by `cresil trim` with order > 0 (repeat-pattern reads)
-                         having segments within --end-tol of both junction ends
-  2 region_length        breakpoints = start of + segments / end of - segments of those
-                         reads; regions = intervals between breakpoints; CReSIL keeps only
-                         regions <= -mwindow (default 100 kb)
+  1 trim_junction_reads  reads in trim.txt (cresil trim keeps mapq >= 30 primary hits) with
+                         segments within --end-tol of both junction ends
+  2 region_length        breakpoints = start of + / end of - segments with order > 0 (every
+                         segment after a read's first); regions = intervals between
+                         breakpoints; CReSIL keeps only regions <= -mwindow (default 100 kb)
   3 read_covers_90pct    a region is kept only if one trimmed read segment covers >= 90% of it
   4 depth_minrsize       mean depth of all trimmed segments >= -depth and length >= -minrsize
   5 in_final_graph       an eccDNA_final.txt entry overlaps the junction's unit
@@ -39,13 +39,15 @@ def main():
                if r["location"] == "whole_contig" or r["support_ge3"] == "yes"]
     contigs = {t["contig"] for t in targets}
     segs = collections.defaultdict(list)       # all trimmed segments (CReSIL aln_reads)
-    sup = collections.defaultdict(list)        # order > 0
+    allsegs = collections.defaultdict(list)    # with strand and read ID, for junction reads
+    sup = collections.defaultdict(list)        # order > 0 (CReSIL trim_sup: breakpoints)
     with open(a.trim) as handle:
         for r in csv.DictReader(handle, delimiter="\t"):
             if r["ref"] not in contigs:
                 continue
             s, e = int(r["r_start"]), int(r["r_end"])
             segs[r["ref"]].append((s, e))
+            allsegs[r["ref"]].append((s, e, int(r["strand"]), r["readid"]))
             if int(r["order"]) > 0:
                 sup[r["ref"]].append((s, e, int(r["strand"]), r["readid"]))
     final = []
@@ -66,21 +68,39 @@ def main():
         for i in range(lengths[c]):
             run += diff[i]; pref.append(pref[-1] + run)
         cov[c] = pref
-        bps[c] = sorted({s if strand == 1 else e for s, e, strand, _ in sup[c]})
+        # CReSIL: 5 bp breakpoint intervals ([s, s+5) for +, [e-5, e) for -), merged.
+        iv = sorted({(s, s + 5) if strand == 1 else (e - 5, e) for s, e, strand, _ in sup[c]})
+        merged = []
+        for x, y in iv:
+            if merged and x <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], y)
+            else:
+                merged.append([x, y])
+        bps[c] = merged
         supsorted[c] = sorted((s, e) for s, e, _, _ in sup[c])
 
     rows = []
     for t in targets:
         c, start, end = t["contig"], int(t["start"]), int(t["end"])
-        reads_s = {rid for s, e, _, rid in sup[c] if abs(s - start) <= a.end_tol or abs(e - start) <= a.end_tol}
-        reads_e = {rid for s, e, _, rid in sup[c] if abs(s - end) <= a.end_tol or abs(e - end) <= a.end_tol}
+        reads_s = {rid for s, e, _, rid in allsegs[c] if abs(s - start) <= a.end_tol}
+        reads_e = {rid for s, e, _, rid in allsegs[c] if abs(e - end) <= a.end_tol}
         if t["location"] == "whole_contig":  # closure: segments near both contig ends
-            reads_s = {rid for s, e, _, rid in sup[c] if s <= a.end_tol}
-            reads_e = {rid for s, e, _, rid in sup[c] if e >= lengths[c] - a.end_tol}
+            reads_s = {rid for s, e, _, rid in allsegs[c] if s <= a.end_tol}
+            reads_e = {rid for s, e, _, rid in allsegs[c] if e >= lengths[c] - a.end_tol}
         jreads = len(reads_s & reads_e)
-        inner = [b for b in bps[c] if start < b < end]
-        edges = [start] + inner + [end]
-        pieces = [(x, y) for x, y in zip(edges, edges[1:]) if y > x]
+        # Regions = gaps between merged breakpoint intervals inside the unit. Gaps shorter than
+        # -minrsize are dropped by CReSIL without breaking a graph, so only longer ones decide.
+        pieces, pos = [], start
+        for x, y in bps[c]:
+            if y <= start or x >= end:
+                continue
+            if x > pos:
+                pieces.append((pos, x))
+            pos = max(pos, y)
+        if pos < end:
+            pieces.append((pos, end))
+        tiny = [p for p in pieces if p[1] - p[0] < a.minrsize]
+        pieces = [p for p in pieces if p not in tiny]
         too_long = [p for p in pieces if p[1] - p[0] > a.mwindow]
         ss = supsorted[c]
         def covered90(p):
@@ -94,20 +114,20 @@ def main():
         ok_len = [p for p in pieces if p not in too_long]
         not90 = [p for p in ok_len if not covered90(p)]
         mean_depth = lambda p: (cov[c][p[1]] - cov[c][p[0]]) / max(1, p[1] - p[0])  # noqa: E731
-        lowdepth = [p for p in ok_len if p not in not90 and (mean_depth(p) < a.depth or p[1] - p[0] < a.minrsize)]
+        lowdepth = [p for p in ok_len if p not in not90 and mean_depth(p) < a.depth]
         hits = [f for f in final if f[0] == c and min(f[2], end) - max(f[1], start) > 0.5 * min(f[2] - f[1], end - start)]
         steps = [("trim_junction_reads", jreads > 0), ("region_length", not too_long), ("read_covers_90pct", not not90),
-                 ("depth_minrsize", not lowdepth), ("in_final_graph", bool(hits)), ("cyclic", any(h[4] for h in hits))]
+                 ("depth_minrsize", bool(pieces) and not lowdepth), ("in_final_graph", bool(hits)), ("cyclic", any(h[4] for h in hits))]
         excluded = next((name for name, ok in steps if not ok), "kept_cyclic")
         rows.append({"junction_id": t["junction_id"], "contig": c, "start": start, "end": end, "length": end - start,
                      "location": t["location"], "label": t["label"], "independent_molecules": t["independent_molecules"],
-                     "trim_junction_reads": jreads, "regions": len(pieces),
+                     "trim_junction_reads": jreads, "regions": len(pieces), "gaps_below_minrsize": len(tiny),
                      "regions_over_mwindow": len(too_long), "max_region_bp": max((p[1] - p[0] for p in pieces), default=0),
                      "regions_not_90pct_covered": len(not90), "regions_low_depth_or_short": len(lowdepth),
                      "cresil_ids": ";".join(sorted({h[3] + ("(cyclic)" if h[4] else "") for h in hits})) or "none",
                      "excluded_at": excluded})
     cols = ["junction_id", "contig", "start", "end", "length", "location", "label", "independent_molecules",
-            "trim_junction_reads", "regions", "regions_over_mwindow", "max_region_bp", "regions_not_90pct_covered",
+            "trim_junction_reads", "regions", "gaps_below_minrsize", "regions_over_mwindow", "max_region_bp", "regions_not_90pct_covered",
             "regions_low_depth_or_short", "cresil_ids", "excluded_at"]
     with open(a.out, "w", newline="") as handle:
         w = csv.DictWriter(handle, fieldnames=cols, delimiter="\t", lineterminator="\n")

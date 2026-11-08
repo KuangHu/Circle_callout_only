@@ -409,7 +409,7 @@ class PipelineTests(unittest.TestCase):
         ev = self.root / "evidence"; ev.mkdir()
         keep = ["eccDNA_final.txt", "cresil_run/subGraphs.summary.txt", "cresil_run/assemGraph/ecc1/reference_regions.fa",
                 "ont_junctions.tsv", "ont_junction_events.tsv", "ont_junction_ids.txt", "ont_junctions.support.paf.gz",
-                "cresil_trace.tsv"]
+                "cresil_trace.tsv", "ont_library.json", "contig_depth.tsv"]
         # final_reads.fa: read sequence for every graph (whole replicons in deep samples); IDs are kept elsewhere.
         omit = ["cresil_run/tmp/merge_genomecov.txt", "cresil_run/tmp/ref_aln.regions.bed.gz",
                 "cresil_run/tmp/ref_aln.bam", "unrecognized.txt", "cresil_run/assemGraph/ecc1/final_reads.fa", "junctions.paf"]
@@ -848,7 +848,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(greps), 5)
         self.assertTrue(all(WORD_GREP.fullmatch(l) for l in greps))
 
-    def junctions(self, paf_rows, contigs={"chr1": 30000, "pl": 3000}, extra=(), seqs=None):
+    def junctions(self, paf_rows, contigs={"chr1": 30000, "pl": 3000}, extra=(), seqs=None, extra_paf=()):
         """paf_rows: (read, qlen, [(qs, qe, strand, contig, ts, te[, mapq[, tp]])]). Returns (rows, events, ids)."""
         import csv as _csv, random as _random
         paf = self.root / "j.paf"; ref = self.root / "j.fa"; out = self.root / "j.tsv"; ev = self.root / "j.events"; ids = self.root / "j.ids"
@@ -865,7 +865,7 @@ class PipelineTests(unittest.TestCase):
                 tp = seg[7] if len(seg) > 7 else "P"
                 lines.append("\t".join(map(str, [read, qlen, qs, qe, strand, contig, len(seqs[contig]), ts, te, te - ts, te - ts,
                                                  mapq, f"tp:A:{tp}", f"AS:i:{te - ts}"])))
-        paf.write_text("\n".join(lines) + "\n")
+        paf.write_text("\n".join(lines + list(extra_paf)) + "\n")
         r = subprocess.run([os.sys.executable, str(REPO / "scripts" / "ont_junctions.py"), str(paf), str(ref), str(out),
                             "--events", str(ev), "--support-ids", str(ids), *extra], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -908,6 +908,23 @@ class PipelineTests(unittest.TestCase):
         rows, _, _ = self.junctions(reads)
         r = rows[0]
         self.assertEqual((r["label"], r["circle_compatible"], r["tandem_flank_molecules"]), ("tandem_supported", "no", "6"))
+
+    def test_ont_junction_cigar_insertion_through_tandem_counts_as_tandem(self):
+        # Long reads through ...L [10000,12000)[10000,12000) R... aligned as ONE alignment with a 2 kb insertion.
+        reads = self.long_background() + self.circle_reads(4)
+        paf_extra = []
+        for i in range(3):
+            ts, te = 8000 - 37 * i, 14000 + 37 * i
+            ql = te - ts + 2000
+            paf_extra.append("\t".join(map(str, [f"ins{i}", ql, 0, ql, "+", "chr1", 30000, ts, te, te - ts, ql, 60,
+                                                  "tp:A:P", f"AS:i:{te - ts}", f"cg:Z:{12000 - ts}M2000I{te - 12000}M"])))
+        rows, events, ids = self.junctions(reads, extra_paf=paf_extra)
+        r = rows[0]
+        self.assertEqual((r["insertion_tandem_molecules"], r["tandem_flank_molecules"], r["label"], r["circle_compatible"]),
+                         ("3", "3", "tandem_supported", "no"))
+        self.assertEqual((r["split_molecules"], r["independent_molecules"]), ("4", "7"))
+        self.assertTrue({"ins0", "ins1", "ins2"} <= set(ids))
+        self.assertEqual(sum(e["evidence"] == "insertion" for e in events), 3)
 
     def test_ont_junction_single_flank_read_is_not_tandem_and_overlap_proves_nothing(self):
         flank = [("x0", 5000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000)])]
