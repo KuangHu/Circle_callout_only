@@ -688,7 +688,8 @@ class PipelineTests(unittest.TestCase):
         return x
 
     def fake_fqd(self, names):
-        def run(cmd, timeout_s):
+        def run(cmd, timeout_s, cwd=None):
+            assert cwd == Path(cmd[-1]).parent  # refseqs resolve from the working directory
             out = Path(cmd[cmd.index("-O") + 1])
             for n in names:
                 fq(out / n)
@@ -719,7 +720,7 @@ class PipelineTests(unittest.TestCase):
     def test_convert_sra_timeout_and_network_isolation(self):
         x = self.sra_context("illumina"); x.c = {"sra_conversion_timeout_minutes": 2}
         seen = {}
-        def hang(cmd, timeout_s):
+        def hang(cmd, timeout_s, cwd=None):
             seen.update(cmd=cmd, timeout=timeout_s)
             return -9, "", "killed", True
         with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
@@ -743,6 +744,8 @@ class PipelineTests(unittest.TestCase):
                         "BX571856.1,gi|49240382|emb|BX571856.1|,false,remote:" + str(raw / "BX571856.1") + "\n"])
         def fake_run(cmd, **kw):
             calls.append(cmd)
+            if cmd[0].endswith("align-info"):
+                self.assertEqual(kw.get("cwd"), raw)
             if cmd[0].endswith("align-info"):
                 return subprocess.CompletedProcess(cmd, 0, next(outputs), "")
             if cmd[0] == "curl":

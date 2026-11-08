@@ -80,7 +80,8 @@ def preflight(x):
             raise ValueError(f"Input checksum mismatch: {path}")
     if x.sra:
         # Internal per-column MD5s of the SRA object, in addition to the S3 transfer checksum.
-        result = subprocess.run([sra_tool("vdb-validate"), str(x.raw_files[0])], capture_output=True, text=True)
+        result = subprocess.run([sra_tool("vdb-validate"), str(x.raw_files[0])], capture_output=True, text=True,
+                                cwd=x.raw_files[0].parent)
         (x.state / "vdb-validate.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
         if result.returncode != 0 or "is consistent" not in result.stdout + result.stderr:
             raise ValueError(f"vdb-validate failed for {x.raw_files[0]}")
@@ -129,7 +130,8 @@ def convert_sra(x):
     isolate = network_isolation()  # refseqs are local (checked in preflight); fail fast instead of hanging
     with tempfile.TemporaryDirectory(prefix="cs-fqd-", dir=local) as tmp:
         rc, so, se, timed_out = run_limited(isolate + [sra_tool("fasterq-dump"), "--split-3", "--skip-technical",
-                                                       "-e", str(x.cpus), "-t", tmp, "-O", str(out), str(x.raw_files[0])], limit)
+                                                       "-e", str(x.cpus), "-t", tmp, "-O", str(out), str(x.raw_files[0])], limit,
+                                             cwd=x.raw_files[0].parent)  # refseqs resolve from the working directory
     (x.state / "fasterq-dump.log").write_text(so + se, encoding="utf-8")
     if timed_out:
         raise RuntimeError(f"fasterq-dump exceeded sra_conversion_timeout_minutes ({limit // 60}); see fasterq-dump.log")

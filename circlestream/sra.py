@@ -5,8 +5,10 @@ against external reference sequences ("refseqs"). fasterq-dump needs those seque
 to rebuild the reads and, if they are not next to the .sra file, fetches them over
 the network. On LRC compute nodes that fetch can hang indefinitely. The 1-CPU fetch
 job (which has working network access) therefore downloads every refseq a run needs
-into the same directory as the .sra file, where sra-tools resolve them locally, and
-the compute job converts with networking disabled and a time limit.
+into the same directory as the .sra file, and every sra-tools call on the object runs
+with that directory as its working directory (refseqs are resolved relative to the
+current directory, not the object's path). The compute job converts with networking
+disabled and a time limit.
 """
 import os
 from pathlib import Path
@@ -34,7 +36,9 @@ def refseq_deps(sra_path):
     Unaligned runs have none (align-info prints only a 'not a database' warning).
     location is 'remote::https://...' when sra-tools would fetch it over the network.
     """
-    result = subprocess.run([sra_tool("align-info"), str(sra_path)], capture_output=True, text=True, timeout=600)
+    # sra-tools look for refseqs in the *working directory*, not beside the object.
+    result = subprocess.run([sra_tool("align-info"), str(sra_path)], capture_output=True, text=True, timeout=600,
+                            cwd=Path(sra_path).parent)
     if result.returncode != 0:
         raise RuntimeError(f"align-info failed ({result.returncode}): {result.stderr.strip()[:300]}")
     deps = []
@@ -112,9 +116,9 @@ def network_isolation():
     return ["unshare", "-rn"] if ok else []
 
 
-def run_limited(argv, timeout_s):
+def run_limited(argv, timeout_s, cwd=None):
     """Run argv in its own process group; kill the whole group on timeout."""
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, cwd=cwd)
     try:
         out, err = proc.communicate(timeout=timeout_s)
         return proc.returncode, out, err, False
