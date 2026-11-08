@@ -17,7 +17,7 @@
 - 必须显式提供未压缩 reference。v0.1 **不自动组装、不选择参考、不发现参考外序列**。含 IS 的 reference 可以来自独立样本组装，不需要 insertion catalog。
 - RCA/enriched/ATAC、PacBio、单端 Illumina、低于 75 bp 的普通 WGS 不混入本配置。
 - 已做 adapter trimming 的 Illumina：默认 `caller.short_read_policy="reject"` 拒绝含 <75 bp reads 的样本；设为 `"drop_pair"` 时任一 mate <75 bp 则整对丢弃，其余 reads 保持原长度，`qc.json` 记录总/丢弃/保留 pairs 和保留碱基。FASTQ 截断、配对 ID、质量长度等错误仍然报错。过滤会去掉部分短片段信号，结果需注明该策略。
-- 数据源：ENA HTTPS 在 LRC 实测每连接约 0.7–2.5 MB/s 且整体被限速；NCBI SRA 的 AWS 公开桶（`https://sra-pub-run-odp.s3.amazonaws.com/sra/<run>/<run>`）实测单连接 12–18 MB/s、8 连接 41–55 MB/s。manifest 中可用 `<run>.sra` 单文件条目（`size_bytes` + `s3_etag`，由 `scripts/sra_manifest.py` 通过 HEAD 生成）；下载后校验 S3 multipart ETag，preflight 再跑 `vdb-validate`，qc 用 `fasterq-dump --split-3`（临时文件在节点本地 /tmp）转 FASTQ，Illumina 无配对的 reads 丢弃并记录。需要在 control env 安装 `sra-tools`。
+- 数据源：ENA HTTPS 在 LRC 实测每连接约 0.7–2.5 MB/s 且整体被限速；NCBI SRA 的 AWS 公开桶（`https://sra-pub-run-odp.s3.amazonaws.com/sra/<run>/<run>`）实测单连接 12–18 MB/s、8 连接 41–55 MB/s。manifest 中可用 `<run>.sra` 单文件条目（`size_bytes` + `s3_etag`，由 `scripts/sra_manifest.py` 通过 HEAD 生成）；下载后校验 S3 multipart ETag，preflight 再跑 `vdb-validate`，qc 用 `fasterq-dump --split-3`（临时文件在节点本地 /tmp）转 FASTQ，Illumina 无配对的 reads 丢弃并记录。需要在 control env 安装 `sra-tools`。以比对形式提交的 run（如 BAM 上传）依赖外部参考序列（refseq）；fasterq-dump 找不到时会联网下载，在计算节点上可能无限挂起。因此下载作业用 `align-info` 列出依赖，把每个 refseq 从 NCBI 下载到 `.sra` 同目录（`vdb-validate` 校验），并记入 download.json；preflight 确认全部依赖已在本地，qc 在断网（`unshare -rn`，节点支持时）和 `sra_conversion_timeout_minutes`（默认 60）限制下转换，超时即失败而不是占满作业时限。
 - `download_mode`：`"dtn"`（默认：DTN 上 `download --watch` + 登录节点 `submit --watch`）或 `"slurm"`（只需在登录节点用 tmux 保持一个 `submit --watch`；它自动提交 1 核下载作业和计算作业，**不再需要 DTN 的 `download --watch`**）。slurm 模式下：
   - 下载：最多 `fetch.max_jobs` 个 1 核作业并发；每个作业逐个下载，样本按空闲 fetch 槽位均分，且不超过 `fetch.max_samples` 个、`fetch.batch_gb` GB。实际供给速度需按批次实测，不能只用 `max_jobs × 单流速度` 推算。
   - 暂存：`scratch_dir` 只放下载的源文件，预算按源文件字节计入 `scratch_budget_gb`。Lustre 元数据延迟高时（实测每次操作 4–30 s），请把暂存目录放在 VAST 组目录。
@@ -56,7 +56,7 @@ python scripts/check_dag.py
 
 在管理员允许联网安装软件的节点执行安装。安装脚本创建三个独立 conda environments；已存在的环境不会自动覆盖。使用其他环境名时同步修改 config 的 command prefixes。
 
-- Circle_finder 固定到 `3eb333db2ea6277dde36cbf640be9afeb710c717`；原始 MIT 源码和许可证在 `third_party/`。
+- Circle_finder 固定到 `3eb333db2ea6277dde36cbf640be9afeb710c717`；原始 MIT 源码和许可证在 `third_party/`。上游脚本不修改；适配层（`circlestream/rules.py`）只把 5 行 `grep -w -Ff ids table` 换成 `scripts/wordgrep.py`，按 GNU grep `-w -F`（C locale）语义逐字节等价地筛选，但避开 GNU grep 在大量互为前缀的 read ID 下的慢路径（单步曾达 2 小时）。空模式或含 tab 的模式交回 grep 本身处理。设置 `CS_WORDGREP_VERIFY=1` 会同时运行 GNU grep 并在任何差异时失败（仅用于验证）。
 - CReSIL 固定到 `78356affa6adca6a41ea297c3d7d93f5ecb5ae6a`，沿用其环境文件，安装时 `pip --no-deps`。
 - conda 求解后的完整环境清单写入 `vendor/*.explicit.txt`。安装需要网络，compute jobs 不联网安装软件。
 

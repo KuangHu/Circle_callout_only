@@ -9,6 +9,7 @@
   "download_host": "lrc-xfer.lbl.gov",
   "download_retries": 3,
   "download_mode": "dtn",
+  "sra_conversion_timeout_minutes": 60,
   "poll_seconds": 60,
   "auto_cleanup": false,
   "slurm": {

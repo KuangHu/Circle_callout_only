@@ -680,7 +680,7 @@ class PipelineTests(unittest.TestCase):
 
     def sra_context(self, platform):
         obj = self.root / "SRR000001.sra"; obj.write_bytes(b"sra")
-        x = SimpleNamespace(s={"platform": platform}, cpus=4, state=self.root / "st", scratch=self.root / "sc")
+        x = SimpleNamespace(s={"platform": platform}, c={}, cpus=4, state=self.root / "st", scratch=self.root / "sc")
         x.state.mkdir(exist_ok=True); (x.scratch / "raw").mkdir(parents=True, exist_ok=True)
         x.raw_files = [obj]
         fqd = x.scratch / "raw" / "fastq"
@@ -688,33 +688,160 @@ class PipelineTests(unittest.TestCase):
         return x
 
     def fake_fqd(self, names):
-        def run(cmd, **kwargs):
+        def run(cmd, timeout_s):
             out = Path(cmd[cmd.index("-O") + 1])
             for n in names:
                 fq(out / n)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            return 0, "", "", False
         return run
 
     def test_convert_sra_illumina_drops_orphans_and_records(self):
         x = self.sra_context("illumina")
         with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
-             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq", "SRR000001.fastq"])):
+             patch("circlestream.rules.run_limited", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq", "SRR000001.fastq"])):
             info = convert_sra(x)
         self.assertEqual(info["dropped_unpaired_files"], ["SRR000001.fastq"])
         self.assertTrue(all(p.is_file() for p in x.inputs))
         self.assertFalse((x.scratch / "raw" / "fastq" / "SRR000001.fastq").exists())
-        with patch("circlestream.rules.subprocess.run") as run:
+        with patch("circlestream.rules.run_limited") as run:
             convert_sra(x); run.assert_not_called()  # completed conversion is reused
 
     def test_convert_sra_layout_mismatch_fails(self):
         x = self.sra_context("illumina")
         with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
-             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001.fastq"])):
+             patch("circlestream.rules.run_limited", side_effect=self.fake_fqd(["SRR000001.fastq"])):
             with self.assertRaises(ValueError): convert_sra(x)
         x = self.sra_context("nanopore")
         with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
-             patch("circlestream.rules.subprocess.run", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq"])):
+             patch("circlestream.rules.run_limited", side_effect=self.fake_fqd(["SRR000001_1.fastq", "SRR000001_2.fastq"])):
             with self.assertRaises(ValueError): convert_sra(x)
+
+    def test_convert_sra_timeout_and_network_isolation(self):
+        x = self.sra_context("illumina"); x.c = {"sra_conversion_timeout_minutes": 2}
+        seen = {}
+        def hang(cmd, timeout_s):
+            seen.update(cmd=cmd, timeout=timeout_s)
+            return -9, "", "killed", True
+        with patch("circlestream.rules.sra_tool", return_value="fasterq-dump"), \
+             patch("circlestream.rules.network_isolation", return_value=["unshare", "-rn"]), \
+             patch("circlestream.rules.run_limited", side_effect=hang):
+            with self.assertRaisesRegex(RuntimeError, "sra_conversion_timeout_minutes"):
+                convert_sra(x)
+        self.assertEqual(seen["timeout"], 120)
+        self.assertEqual(seen["cmd"][:3], ["unshare", "-rn", "fasterq-dump"])
+
+    def test_run_limited_kills_process_group(self):
+        from circlestream.sra import run_limited
+        rc, _, _, timed_out = run_limited(["bash", "-c", "sleep 30 & sleep 30; wait"], 1)
+        self.assertTrue(timed_out)
+
+    def test_refseq_deps_parsing_and_fetch(self):
+        from circlestream import sra
+        raw = self.root / "raw"; raw.mkdir(); obj = raw / "ERR1.sra"; obj.write_bytes(b"x")
+        calls = []
+        outputs = iter(["BX571856.1,gi|49240382|emb|BX571856.1|,false,remote::https://sra-download.ncbi.nlm.nih.gov/traces/refseq/BX571856.1\n",
+                        "BX571856.1,gi|49240382|emb|BX571856.1|,false,remote:" + str(raw / "BX571856.1") + "\n"])
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[0].endswith("align-info"):
+                return subprocess.CompletedProcess(cmd, 0, next(outputs), "")
+            if cmd[0] == "curl":
+                Path(cmd[cmd.index("--output") + 1]).write_bytes(b"refseq")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "Table 'BX571856.1' is consistent", "")  # vdb-validate
+        with patch("circlestream.sra.sra_tool", side_effect=lambda n: n), patch("circlestream.sra.subprocess.run", side_effect=fake_run):
+            recs = sra.fetch_refseqs(obj, 2)
+        self.assertEqual(recs[0]["seqid"], "BX571856.1"); self.assertEqual(recs[0]["size_bytes"], 6)
+        self.assertTrue((raw / "BX571856.1").is_file()); self.assertFalse((raw / "BX571856.1.part").exists())
+        self.assertIn("https://sra-download.ncbi.nlm.nih.gov/traces/refseq/BX571856.1", [c[-1] for c in calls if c[0] == "curl"])
+        # Still remote after download -> hold the sample instead of letting conversion hang.
+        outputs = iter(["A1.1,a,false,remote::https://sra-download.ncbi.nlm.nih.gov/traces/refseq/A1.1\n"] * 2)
+        with patch("circlestream.sra.sra_tool", side_effect=lambda n: n), patch("circlestream.sra.subprocess.run", side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                sra.fetch_refseqs(obj, 1)
+        # Unaligned runs: align-info prints only a warning, no dependencies.
+        with patch("circlestream.sra.sra_tool", side_effect=lambda n: n), \
+             patch("circlestream.sra.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "warn: not a database")):
+            self.assertEqual(sra.fetch_refseqs(obj, 1), [])
+
+    def test_unexpected_refseq_location_rejected(self):
+        from circlestream import sra
+        raw = self.root / "raw"; raw.mkdir(); obj = raw / "ERR1.sra"; obj.write_bytes(b"x")
+        with patch("circlestream.sra.sra_tool", side_effect=lambda n: n), \
+             patch("circlestream.sra.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "X1.1,a,false,remote::http://evil/X1.1\n", "")):
+            with self.assertRaisesRegex(ValueError, "unexpected location"):
+                sra.fetch_refseqs(obj, 1)
+
+    def test_fetch_inputs_records_refseqs_for_sra(self):
+        from circlestream.controller import fetch_inputs
+        state = self.root / "st"; scratch = self.root / "sc"; state.mkdir(); (scratch / "raw").mkdir(parents=True)
+        sample = {"files": [{"name": "ERR1.sra", "url": "https://x/ERR1", "size_bytes": 1, "s3_etag": "0" * 32}]}
+        with patch("circlestream.controller.download_file"), \
+             patch("circlestream.controller.fetch_refseqs", return_value=[{"seqid": "BX571856.1"}]) as fr:
+            fetch_inputs(self.c, sample, state, scratch)
+        fr.assert_called_once()
+        self.assertEqual(read_json(state / "download.json")["refseqs"], [{"seqid": "BX571856.1"}])
+
+    def grep_binary(self):
+        for cand in [Path(os.environ.get("CONDA_PREFIX", "/nonexistent")) / "bin" / "grep", shutil.which("grep")]:
+            if cand and Path(cand).is_file():
+                out = subprocess.run([str(cand), "--version"], capture_output=True, text=True).stdout
+                if "GNU grep" in out:
+                    return str(cand)
+        self.skipTest("GNU grep not available")
+
+    def wordgrep(self, pats, table, env=None):
+        p = self.root / "pats.txt"; t = self.root / "table.txt"
+        p.write_bytes(pats); t.write_bytes(table)
+        ours = subprocess.run([os.sys.executable, str(REPO / "scripts" / "wordgrep.py"), str(p), str(t)], capture_output=True,
+                              env=dict(os.environ, **(env or {})))
+        ref = subprocess.run([self.grep_binary(), "-w", "-F", "-f", str(p), str(t)], capture_output=True, env=dict(os.environ, LC_ALL="C"))
+        return ours, ref
+
+    def test_wordgrep_matches_gnu_grep_on_randomized_tables(self):
+        import random
+        rng = random.Random(7)
+        for trial in range(40):
+            ids = [f"ERR{rng.randint(1, 3)}.{rng.randint(1, 300)}" for _ in range(60)] + [str(rng.randint(1, 500)) for _ in range(5)] \
+                + [f"r{rng.randint(1, 50)}-x:{rng.randint(1, 9)}" for _ in range(5)] + ["NC_1.2", "101M", "+", "first"]
+            rows = []
+            for _ in range(400):
+                rid = rng.choice(ids[:-4] + [f"ERR1.{rng.randint(1, 3000)}", f"ERR2.{rng.randint(1, 30)}.5", "a_b.c"])
+                cigar = rng.choice(["101M", "50M51S", "30S71M", "60H41M"])
+                rows.append(f"{rng.choice(['NC_1.2', 'chr1', 'contig_7.1'])}\t{rng.randint(0, 600)}\t{rng.randint(0, 600)}\t{rid}\t"
+                            f"{rng.choice('12')}\t{rng.randint(0, 60)}\t{rng.choice('+-')}\t{cigar}" + rng.choice(["", "\tfirst", "\tsecond"]))
+            pats = rng.sample(ids, rng.randint(0, 30))
+            table = ("\n".join(rows) + rng.choice(["\n", ""])).encode()
+            ours, ref = self.wordgrep(("\n".join(pats) + ("\n" if pats else "")).encode(), table)
+            self.assertEqual(ours.returncode, 0, ours.stderr)
+            self.assertEqual(ours.stdout, ref.stdout, f"trial {trial}")
+
+    def test_wordgrep_edge_cases(self):
+        cases = [
+            (b"", b"a\tb\n"),                          # no patterns -> nothing
+            (b"\n", b"a\tb\n\n"),                      # one empty pattern -> grep's own behaviour
+            (b"a\n\nb\n", b"x\ty\na\n"),               # empty pattern among others
+            (b"12\n", b"c\t12\t5\tERR1.3\n"),          # numeric ID also matching a coordinate column
+            (b"ERR1.1\n", b"c\t1\t2\tERR1.12\nc\t1\t2\tERR1.1\n"),  # prefix must not match
+            (b"ERR1.1\n", b"c\t1\t2\tERR1.1.5\n"),     # '.' is a word boundary
+            (b"a b\n", b"x\ta b\tz\n"),                # pattern with a space
+            (b"ERR1.1", b"c\t1\t2\tERR1.1"),           # no trailing newlines
+        ]
+        for pats, table in cases:
+            ours, ref = self.wordgrep(pats, table)
+            self.assertIn(ours.returncode, (0,), (pats, table, ours.stderr))
+            self.assertEqual(ours.stdout, ref.stdout, (pats, table))
+
+    def test_wordgrep_verify_mode(self):
+        ours, ref = self.wordgrep(b"ERR1.1\n", b"c\t1\t2\tERR1.1\n", env={"CS_WORDGREP_VERIFY": "1"})
+        self.assertEqual(ours.returncode, 0); self.assertIn(b"IDENTICAL", ours.stderr); self.assertEqual(ours.stdout, ref.stdout)
+
+    def test_circle_finder_adapter_replaces_every_word_grep(self):
+        from circlestream.rules import WORD_GREP
+        lines = cf_lines("call")
+        greps = [l for l in lines if "grep" in l]
+        self.assertEqual(len(greps), 5)
+        self.assertTrue(all(WORD_GREP.fullmatch(l) for l in greps))
 
 
 if __name__=="__main__": unittest.main()

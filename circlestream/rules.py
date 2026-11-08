@@ -16,9 +16,12 @@ import time
 
 from .common import GB, REPO, digest, fingerprint, is_sra, read_json, source_ok, state_paths, work_root, write_json
 from .fastq import extract, materialize
+from .sra import network_isolation, refseq_deps, run_limited, sra_tool, unresolved
 
 CF_SHA256 = "a7df874bb976cd8761840f91190df43ac3dc949b7e97796441b86b0bb699acd2"
 CRESIL_COMMIT = "78356affa6adca6a41ea297c3d7d93f5ecb5ae6a"
+# Upstream read-ID filters, e.g. grep -w -Ff $6-$7\.split.id-freq2.txt $6-$7\.split.txt > $6-$7\.split_freq2.txt
+WORD_GREP = re.compile(r"grep -w -Ff (\S+) (\S+) > (\S+)")
 
 
 class Context:
@@ -81,6 +84,12 @@ def preflight(x):
         (x.state / "vdb-validate.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
         if result.returncode != 0 or "is consistent" not in result.stdout + result.stderr:
             raise ValueError(f"vdb-validate failed for {x.raw_files[0]}")
+        # Aligned-read runs: every reference sequence must already sit beside the object
+        # (fetched by the download step), so conversion never touches the network.
+        deps = refseq_deps(x.raw_files[0])
+        write_json(x.state / "sra-refseqs.json", [{"seqid": i, "location": loc} for i, loc in deps])
+        if unresolved(deps):
+            raise ValueError(f"SRA object needs reference sequences that were not downloaded: {unresolved(deps)}")
     binaries = ["samtools", "bedtools", "bash"]
     binaries += ["bwa", "samblaster", "awk", "grep", "sed", "sort"] if x.s["platform"] == "illumina" else ["cresil", "minimap2", "mosdepth"]
     x.shell("command -v " + " ".join(binaries))
@@ -106,14 +115,6 @@ def preflight(x):
     })
 
 
-def sra_tool(name):
-    """sra-tools live in the control environment next to the worker's Python."""
-    path = Path(sys.executable).parent / name
-    if not path.is_file():
-        raise FileNotFoundError(f"{name} not found beside {sys.executable}; install sra-tools in the control env")
-    return str(path)
-
-
 def convert_sra(x):
     """fasterq-dump into raw/fastq; random-access temp files go to node-local disk."""
     out = x.inputs[0].parent
@@ -124,12 +125,16 @@ def convert_sra(x):
     out.mkdir(parents=True)
     local = os.environ.get("TMPDIR") if os.environ.get("TMPDIR", "").startswith("/tmp") else "/tmp"
     start = time.time()
+    limit = 60 * x.c.get("sra_conversion_timeout_minutes", 60)
+    isolate = network_isolation()  # refseqs are local (checked in preflight); fail fast instead of hanging
     with tempfile.TemporaryDirectory(prefix="cs-fqd-", dir=local) as tmp:
-        result = subprocess.run([sra_tool("fasterq-dump"), "--split-3", "--skip-technical", "-e", str(x.cpus),
-                                 "-t", tmp, "-O", str(out), str(x.raw_files[0])], capture_output=True, text=True)
-    (x.state / "fasterq-dump.log").write_text(result.stdout + result.stderr, encoding="utf-8")
-    if result.returncode != 0:
-        raise RuntimeError(f"fasterq-dump failed ({result.returncode}); see fasterq-dump.log")
+        rc, so, se, timed_out = run_limited(isolate + [sra_tool("fasterq-dump"), "--split-3", "--skip-technical",
+                                                       "-e", str(x.cpus), "-t", tmp, "-O", str(out), str(x.raw_files[0])], limit)
+    (x.state / "fasterq-dump.log").write_text(so + se, encoding="utf-8")
+    if timed_out:
+        raise RuntimeError(f"fasterq-dump exceeded sra_conversion_timeout_minutes ({limit // 60}); see fasterq-dump.log")
+    if rc != 0:
+        raise RuntimeError(f"fasterq-dump failed ({rc}); see fasterq-dump.log")
     produced = sorted(p.name for p in out.glob("*.fastq"))
     expected = sorted(p.name for p in x.inputs)
     orphans = [n for n in produced if n not in expected]
@@ -139,6 +144,7 @@ def convert_sra(x):
         raise ValueError(f"Unexpected extra reads from ONT SRA object: {orphans}")
     # Illumina --split-3 puts mate-less reads in <run>.fastq; record and drop them (pairs only).
     info = {"seconds": time.time() - start, "tool": "fasterq-dump --split-3 --skip-technical",
+            "network_isolated": bool(isolate), "timeout_seconds": limit,
             "outputs": {n: (out / n).stat().st_size for n in produced}, "dropped_unpaired_files": orphans}
     for n in orphans:
         (out / n).unlink()
@@ -207,9 +213,16 @@ def circle_finder(x, stage):
             # samblaster writes no header when nothing is unmapped/clipped; unmap.bam is unused downstream.
             write_json(x.log / f"cf-{stage}-{index}.json", {"command": code, "skipped": "empty unmap.sam"})
             continue
+        record = {"command": code}
+        m = WORD_GREP.fullmatch(code)
+        if m:
+            # Same selection as upstream `grep -w -Ff`, without GNU grep's slow path (scripts/wordgrep.py).
+            record["executed"] = code = (f"{shlex.quote(sys.executable)} {shlex.quote(str(REPO / 'scripts' / 'wordgrep.py'))} "
+                                         f"{m.group(1)} {m.group(2)} > {m.group(3)}")
         started = time.monotonic()
         x.shell(preamble + code, cwd=x.out, args=args)
-        write_json(x.log / f"cf-{stage}-{index}.json", {"command": code, "seconds": time.monotonic()-started})
+        record["seconds"] = time.monotonic() - started
+        write_json(x.log / f"cf-{stage}-{index}.json", record)
 
 
 def mapping(x):

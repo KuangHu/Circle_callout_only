@@ -172,6 +172,8 @@ def load_config(path):
             raise ValueError("slurm mode needs fetch: {max_jobs, batch_gb, time, memory_gb}")
         if f["max_jobs"] <= 0 or f["batch_gb"] <= 0 or f["memory_gb"] <= 0 or f.get("max_samples", 10) <= 0:
             raise ValueError("fetch limits must be positive")
+    if c.get("sra_conversion_timeout_minutes", 60) <= 0:
+        raise ValueError("sra_conversion_timeout_minutes must be positive")
     if c["caller"].get("short_read_policy", "reject") not in ("reject", "drop_pair"):
         raise ValueError("caller.short_read_policy must be reject or drop_pair")
     return c

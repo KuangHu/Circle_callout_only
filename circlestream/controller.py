@@ -13,9 +13,10 @@ import sys
 import tarfile
 import time
 
-from .common import (GB, REPO, digest, fingerprint, load_config, lock, read_json,
+from .common import (GB, REPO, digest, fingerprint, is_sra, load_config, lock, read_json,
                      local_mode, safe_id, set_status, source_ok, state_paths, tree_size, validate_sample, work_root,
                      write_json, workflow_fingerprint)
+from .sra import fetch_refseqs
 
 ACTIVE_JOBS = {"SUBMITTING", "QUEUED", "RUNNING"}
 HELD = {"DOWNLOAD_FAILED", "COMPUTE_FAILED", "CLEANUP_FAILED"}
@@ -163,9 +164,14 @@ def claim_scratch(state, scratch, spec):
 def fetch_inputs(c, sample, state, scratch):
     """Download (or resume) source files into owned scratch and record timing."""
     start = time.time()
+    refseqs = []
     for item in sample["files"]:
         download_file(item, scratch / "raw", c["download_retries"])
+        if is_sra(item):
+            # Aligned-read runs need their reference sequences beside the object (see sra.py).
+            refseqs += fetch_refseqs(scratch / "raw" / item["name"], c["download_retries"])
     write_json(state / "download.json", {
+        "refseqs": refseqs,
         "seconds": time.time() - start,
         "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
         "host": socket.getfqdn(), "in_job": bool(os.environ.get("SLURM_JOB_ID")),
