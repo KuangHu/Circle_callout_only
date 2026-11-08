@@ -7,7 +7,9 @@ The long-read counterpart of Circle_finder's split reads, independent of CReSIL:
   same contig and strand where the read jumps BACK along the reference: on the plus
   strand it reaches X (end of segment a) and continues at Y < X (start of segment b).
   The candidate circle is [Y, X). Minus-strand reads are mirrored.
-* Events are clustered by (contig, start, end) within --tolerance bp.
+* Events are clustered by (contig, start, end): an event joins a cluster when both
+  endpoints are within --tolerance bp of the cluster's running median (ONT endpoint
+  jitter otherwise splits one junction into several clusters).
 * Per cluster:
     junction_reads     reads with at least one event
     multipass_reads    reads with >= 2 events
@@ -21,9 +23,13 @@ The long-read counterpart of Circle_finder's split reads, independent of CReSIL:
                        unit + 2 x flank): how many beyond-unit reads a tandem copy
                        would have produced in this library.
 * label (evidence categories, not proof of topology):
-    replicon_junction  end->start of a whole contig (plasmid or closed chromosome)
-    tandem_or_mixed    some reads reach beyond one unit
-    circle_supported   >= --min-reads junction reads, none beyond one unit, although
+    replicon_junction  end->start of a whole contig (plasmid or closed chromosome);
+                       --replicon-slack covers the terminal overlap that assemblers
+                       leave on circular contigs (up to the largest k-mer, ~127 bp)
+    tandem_or_mixed    >= --min-beyond beyond-unit reads AND >= --min-beyond-frac of
+                       expected_beyond_if_tandem (a lone chimeric read does not count)
+    circle_supported   >= --min-reads junction reads, beyond-unit reads below the
+                       tandem threshold, although
                        a tandem copy would have given >= --min-expected-beyond
     junction_ambiguous enough junction reads, but reads too short to tell a circle
                        from a tandem copy (the same ambiguity as short reads)
@@ -80,17 +86,26 @@ def events_for_read(segs, max_qgap, min_circle):
 
 
 def cluster(events, tolerance):
-    """Greedy clustering on (contig, start, end); returns list of clusters of event indices."""
+    """Cluster on (contig, start, end) against each cluster's running median endpoints.
+
+    Sorted by (contig, start, end); an event joins the nearest recent cluster whose median
+    start and end are both within tolerance. Returns clusters of event indices."""
     order = sorted(range(len(events)), key=lambda i: (events[i][1], events[i][2], events[i][3]))
     clusters = []
     for i in order:
         contig, s, e = events[i][1], events[i][2], events[i][3]
+        best = None
         for c in reversed(clusters[-50:]):
             if c["contig"] == contig and abs(c["s"] - s) <= tolerance and abs(c["e"] - e) <= tolerance:
-                c["members"].append(i)
-                break
+                d = abs(c["s"] - s) + abs(c["e"] - e)
+                if best is None or d < best[0]:
+                    best = (d, c)
+        if best:
+            c = best[1]
+            c["members"].append(i); bisect.insort(c["ss"], s); bisect.insort(c["es"], e)
+            c["s"], c["e"] = c["ss"][len(c["ss"]) // 2], c["es"][len(c["es"]) // 2]
         else:
-            clusters.append({"contig": contig, "s": s, "e": e, "members": [i]})
+            clusters.append({"contig": contig, "s": s, "e": e, "ss": [s], "es": [e], "members": [i]})
     return clusters
 
 
@@ -102,11 +117,14 @@ def main():
     ap.add_argument("--min-aln", type=int, default=200)
     ap.add_argument("--max-qgap", type=int, default=200)
     ap.add_argument("--min-circle", type=int, default=100)
-    ap.add_argument("--tolerance", type=int, default=20)
+    ap.add_argument("--tolerance", type=int, default=50)
     ap.add_argument("--flank", type=int, default=100)
     ap.add_argument("--min-reads", type=int, default=3)
-    ap.add_argument("--replicon-slack", type=int, default=50)
+    ap.add_argument("--replicon-slack", type=int, default=150)
     ap.add_argument("--min-expected-beyond", type=float, default=3.0)
+    ap.add_argument("--min-beyond", type=int, default=2, help="beyond-unit reads needed to call tandem_or_mixed")
+    ap.add_argument("--min-beyond-frac", type=float, default=0.1,
+                    help="...and at least this fraction of expected_beyond_if_tandem")
     a = ap.parse_args()
     lengths = {l.split("\t")[0]: int(l.split("\t")[1]) for l in open(a.fai) if l.strip()}
     events = []  # (read, contig, start, end, beyond)
@@ -136,7 +154,7 @@ def main():
         expected_beyond = len(per_read) * frac_long
         if start <= a.replicon_slack and end >= L - a.replicon_slack:
             label = "replicon_junction"
-        elif beyond:
+        elif len(beyond) >= a.min_beyond and len(beyond) >= a.min_beyond_frac * expected_beyond:
             label = "tandem_or_mixed"
         elif len(per_read) < a.min_reads:
             label = "low_support"

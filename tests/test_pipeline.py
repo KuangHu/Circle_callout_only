@@ -906,6 +906,40 @@ class PipelineTests(unittest.TestCase):
         rows, ids = self.junctions(reads)
         self.assertEqual(rows, []); self.assertEqual(ids, [])
 
+    def circle_reads(self, n, prefix="c", jitter=0):
+        # Linearized 2 kb circle [10000,12000); endpoints shifted by up to `jitter` bp (ONT noise).
+        out = []
+        for i in range(n):
+            d = (i * 7) % (jitter + 1) if jitter else 0
+            cut = 10500 + 50 * (i % 20)
+            out.append((f"{prefix}{i}", 1900, [(0, 12000 - d - cut, "+", "chr1", cut, 12000 - d),
+                                               (12000 - d - cut, 1900, "+", "chr1", 10000 + d, 10000 + d + 1900 - (12000 - d - cut))]))
+        return out
+
+    def test_ont_junction_endpoint_jitter_stays_one_cluster(self):
+        rows, _ = self.junctions(self.long_background() + self.circle_reads(30, jitter=40))
+        self.assertEqual(len(rows), 1); self.assertEqual(rows[0]["junction_reads"], "30")
+        self.assertEqual(rows[0]["label"], "circle_supported")
+
+    def test_ont_junction_assembler_terminal_overlap_is_replicon(self):
+        # Circular 3 kb plasmid assembled as a 3100 bp contig: the last 100 bp repeat the first 100 bp,
+        # so the same closure is seen as 3000->0, 3100->100 or anything in between.
+        reads = self.long_background()
+        for i in range(8):
+            o = (i * 13) % 101
+            reads.append((f"p{i}", 2000, [(0, 1000, "+", "pl", 2000 + o, 3000 + o), (1000, 2000, "+", "pl", o, 1000 + o)]))
+        rows, _ = self.junctions(reads, contigs={"chr1": 30000, "pl": 3100})
+        self.assertEqual([(r["contig"], r["start"], r["end"], r["label"]) for r in rows], [("pl", "0", "3100", "replicon_junction")])
+
+    def test_ont_junction_lone_chimeric_read_does_not_make_tandem(self):
+        chimera = [("x0", 5000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000)])]
+        rows, _ = self.junctions(self.long_background() + self.circle_reads(20) + chimera)
+        self.assertEqual(rows[0]["beyond_unit_reads"], "1"); self.assertEqual(rows[0]["label"], "circle_supported")
+        chimera.append(("x1", 5000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000)]))
+        chimera.append(("x2", 5000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000)]))
+        rows, _ = self.junctions(self.long_background() + self.circle_reads(20) + chimera)
+        self.assertEqual(rows[0]["label"], "tandem_or_mixed")  # 3 >= 2 and >= 0.1 x ~23 expected
+
     def test_config_rejects_unknown_ont_junction_key(self):
         c = dict(self.c, caller=dict(self.c["caller"], ont_junction={"min_reads": 3, "bogus": 1}))
         p = self.root / "cfg.json"; write_json(p, c)
