@@ -99,8 +99,10 @@ def main():
             by_species[row["Scientific_Name"]].append(row)
     need = a.target - len(pilot)
     ranked = sorted(by_species, key=lambda s: (-len(by_species[s]), s))
-    quotas = {s: a.per_species for s in ranked[:a.top_species]}
-    quotas["other"] = max(0, need - sum(quotas.values()))
+    quotas, left = {}, max(0, need)
+    for s in ranked[:a.top_species]:  # never more than the remaining target (--target small)
+        quotas[s] = min(a.per_species, left); left -= quotas[s]
+    quotas["other"] = left
     strata = {s: by_species[s] for s in ranked[:a.top_species]}
     strata["other"] = [r for s in ranked[a.top_species:] for r in by_species[s]]
 

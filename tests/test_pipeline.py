@@ -854,6 +854,47 @@ class PipelineTests(unittest.TestCase):
              patch("circlestream.sra.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "warn: not a database")):
             self.assertEqual(sra.fetch_refseqs(obj, 1), [])
 
+    def test_refseq_resolved_from_host_cache_is_still_staged_beside_object(self):
+        from circlestream import sra
+        raw = self.root / "raw"; raw.mkdir(); obj = raw / "ERR1.sra"; obj.write_bytes(b"x")
+        cache = "local::/home/u/ncbi/public/refseq/BX571856.1"  # this node's cache; absent on compute nodes
+        outputs = iter([f"BX571856.1,a,false,{cache}\n", f"BX571856.1,a,false,local::{raw}/BX571856.1\n"])
+        curls = []
+        def fake_run(cmd, **kw):
+            if cmd[0].endswith("align-info"):
+                return subprocess.CompletedProcess(cmd, 0, next(outputs), "")
+            if cmd[0] == "curl":
+                curls.append(cmd[-1]); Path(cmd[cmd.index("--output") + 1]).write_bytes(b"refseq")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "Table is consistent", "")
+        with patch("circlestream.sra.sra_tool", side_effect=lambda n: n), patch("circlestream.sra.subprocess.run", side_effect=fake_run):
+            recs = sra.fetch_refseqs(obj, 1)
+        self.assertEqual(curls, ["https://sra-download.ncbi.nlm.nih.gov/traces/refseq/BX571856.1"])
+        self.assertEqual((recs[0]["location_before"], recs[0]["size_bytes"]), (cache, 6))
+        self.assertTrue((raw / "BX571856.1").is_file())
+
+    def test_select_ont_quotas_never_exceed_target(self):
+        import sys
+        sys.path.insert(0, str(REPO / "scripts"))
+        import select_ont
+        master = self.root / "master.tsv"; ont = self.root / "ont.tsv"
+        m = ["Sample_ID\tScientific_Name\tRef_FTP"]; o = ["run_accession\tsample_accession\tbase_count"]; meta = {}
+        for sp in range(4):
+            for i in range(6):
+                sid = f"S{sp}_{i}"; run = f"ERR{sp}{i}"
+                m.append(f"{sid}\tsp{sp}\tref"); o.append(f"{run}\t{sid}\t{(i + 1) * 1e8}")
+                meta[run] = {"instrument_platform": "OXFORD_NANOPORE", "library_strategy": "WGS", "library_source": "GENOMIC",
+                             "sample_accession": sid, "instrument_model": "m", "base_count": str(int((i + 1) * 1e8)), "read_count": "1000"}
+        master.write_text("\n".join(m) + "\n"); ont.write_text("\n".join(o) + "\n")
+        argv = ["select_ont.py", str(master), str(ont), "--out", str(self.root / "sel"), "--target", "5",
+                "--top-species", "3", "--per-species", "3"]
+        with patch.object(sys, "argv", argv), patch.object(select_ont, "head", return_value=(10**6, "e")), \
+                patch.object(select_ont.select_runs, "ena_meta", side_effect=lambda runs: {r: meta[r] for r in runs}):
+            select_ont.main()
+        j = read_json(self.root / "sel" / "selection.json")
+        self.assertEqual((j["selected"], sum(j["quotas"].values())), (5, 5))
+        self.assertEqual(len((self.root / "sel" / "selection.tsv").read_text().splitlines()) - 1, 5)
+
     def test_unexpected_refseq_location_rejected(self):
         from circlestream import sra
         raw = self.root / "raw"; raw.mkdir(); obj = raw / "ERR1.sra"; obj.write_bytes(b"x")
@@ -911,6 +952,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(sra.stage_refseqs(src / "ERR1.sra", target, 1), [{"seqid": "BX571856.1"}])
         self.assertEqual((raw / "BX571856.1").read_bytes(), b"vdb")
         fr.assert_called_once_with(target, 1)
+        (raw / "BX571856.1").unlink()
         with patch.object(sra, "refseq_deps", return_value=deps), patch.object(sra, "validate_vdb", return_value=(False, "bad")):
             with self.assertRaisesRegex(RuntimeError, "vdb-validate"):
                 sra.stage_refseqs(src / "ERR1.sra", target, 1)

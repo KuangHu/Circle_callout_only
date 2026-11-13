@@ -90,21 +90,23 @@ def fetch_refseqs(sra_path, retries):
     """
     sra_path = Path(sra_path)
     records = []
-    for seqid, location in refseq_deps(sra_path):
+    deps = refseq_deps(sra_path)
+    for seqid, location in deps:
         dest = sra_path.parent / seqid
         url = REFSEQ_URL.format(seqid)
-        if location.startswith("remote::"):
-            if location != "remote::" + url:
-                raise ValueError(f"Refseq {seqid} resolves to an unexpected location: {location}")
+        if location.startswith("remote::") and location != "remote::" + url:
+            raise ValueError(f"Refseq {seqid} resolves to an unexpected location: {location}")
+        # Stage every dependency beside the object: one resolved from a host-local sra-tools
+        # cache on this node would look remote on a compute node without that cache.
+        fetched = not dest.exists()
+        if fetched:
             _curl(url, dest, retries)
-            fetched = True
-        else:
-            fetched = False
         records.append({"seqid": seqid, "url": url if fetched else None, "location_before": location,
                         "size_bytes": dest.stat().st_size if dest.is_file() else None})
     left = unresolved(refseq_deps(sra_path))
-    if left:
-        raise RuntimeError(f"Refseqs still unresolved after download: {left}")
+    missing = [seqid for seqid, _ in deps if not (sra_path.parent / seqid).exists()]
+    if left or missing:
+        raise RuntimeError(f"Refseqs still unresolved or not staged after download: {left + missing}")
     return records
 
 
@@ -112,9 +114,8 @@ def stage_refseqs(source, target, retries):
     """stage-local of an SRA object: copy refseq tables kept beside the source (each must pass
     vdb-validate), then fetch_refseqs() downloads any still missing and checks all resolve."""
     for seqid, location in refseq_deps(target):
-        local = Path(source).parent / seqid
-        if location.startswith("remote::") and local.is_file():
-            dest = Path(target).parent / seqid
+        local, dest = Path(source).parent / seqid, Path(target).parent / seqid
+        if local.is_file() and not dest.exists():
             shutil.copy2(local, dest)
             ok, text = validate_vdb(dest)
             if not ok:
