@@ -52,11 +52,18 @@ def main():
         for row in csv.DictReader(handle, delimiter="\t"):
             if row["base_count"] and float(row["base_count"]) >= a.min_ont_bases:
                 ont[row["sample_accession"]].append(row["run_accession"])
-    by_species = collections.defaultdict(list)
+    # master_list has one row per Illumina run: keep one row per BioSample (the first with a
+    # paired-end run), so a sample can never be drawn twice.
+    first = {}
     with open(a.master_list, newline="") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
-            if row["Sample_ID"] in ont:
-                by_species[row["Scientific_Name"]].append(row)
+            sid = row["Sample_ID"]
+            has_run = bool(re.search(r"/([SED]RR\d+)_1\.fastq\.gz(?:;|$)", row["Read_FTP"]))
+            if sid in ont and (sid not in first or (has_run and not first[sid][1])):
+                first[sid] = (row, has_run)
+    by_species = collections.defaultdict(list)
+    for row, _ in first.values():
+        by_species[row["Scientific_Name"]].append(row)
     ranked = sorted(by_species, key=lambda s: (-len(by_species[s]), s))
     strata = {s: (by_species[s], a.per_species) for s in ranked[:a.top_species]}
     strata["other"] = ([r for s in ranked[a.top_species:] for r in by_species[s]], a.other)

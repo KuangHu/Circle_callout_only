@@ -1159,9 +1159,55 @@ class PipelineTests(unittest.TestCase):
             call(x)
         j = read_json(x.state / "calls.json")
         self.assertEqual(j["ont_junctions"], {"junctions": 7})
-        self.assertEqual((j["cresil"]["status"], j["candidate_count"]), ("failed", None))
+        self.assertEqual((j["cresil"]["status"], j["cresil"]["stage"], j["candidate_count"]), ("failed", "identify", None))
         self.assertIn("ovl_5end", j["cresil"]["error_tail"][-1])
         self.assertFalse((x.out / "eccDNA_final.txt").exists())
+
+    def test_ont_trim_failure_still_runs_junction_scan(self):
+        from circlestream.rules import mapping, call
+        x = self.ont_rule_context()
+        def run(args, **kw):
+            if args[:2] == ["cresil", "trim"]:
+                (x.out / "trim.txt").write_text("partial")
+                (x.log / "mapping.1.1.stderr.log").write_text("Killed\n")
+                raise subprocess.CalledProcessError(137, args)
+            raise AssertionError(f"no CReSIL step may run after a trim failure: {args}")
+        x.run = run
+        mapping(x)  # must not raise
+        self.assertFalse((x.out / "trim.txt").exists())
+        with patch("circlestream.rules.ont_junctions", return_value={"junctions": 3}) as scan:
+            call(x)
+        scan.assert_called_once()
+        j = read_json(x.state / "calls.json")
+        self.assertEqual(j["ont_junctions"], {"junctions": 3})
+        self.assertEqual((j["cresil"]["status"], j["cresil"]["stage"], j["cresil"]["returncode"]), ("failed", "trim", 137))
+        self.assertEqual(j["cresil"]["error_tail"], ["Killed"])
+
+    def test_select_paired_draws_each_biosample_once(self):
+        import sys
+        sys.path.insert(0, str(REPO / "scripts"))
+        import select_paired
+        master = self.root / "master.tsv"
+        rows = ["Sample_ID\tScientific_Name\tRead_FTP\tRef_FTP"]
+        for run in ("SRR1", "SRR2", "SRR3"):  # one BioSample, three Illumina run rows
+            rows.append(f"S1\tE. coli\tftp/{run}_1.fastq.gz;ftp/{run}_2.fastq.gz\tref1")
+        rows.append("S2\tE. coli\tftp/SRR9_1.fastq.gz\tref2")
+        master.write_text("\n".join(rows) + "\n")
+        ont = self.root / "ont.tsv"
+        ont.write_text("run_accession\tsample_accession\tbase_count\nERR1\tS1\t9e8\nERR2\tS2\t9e8\n")
+        owner = {"SRR1": "S1", "SRR2": "S1", "SRR3": "S1", "SRR9": "S2", "ERR1": "S1", "ERR2": "S2"}
+        def meta(runs):
+            return {r: {"instrument_platform": "ILLUMINA" if r.startswith("SRR") else "OXFORD_NANOPORE",
+                        "library_strategy": "WGS", "library_layout": "PAIRED", "sample_accession": owner[r],
+                        "instrument_model": "m", "base_count": "9e8"} for r in runs}
+        argv = ["select_paired.py", str(master), str(ont), "--out", str(self.root / "sel"),
+                "--top-species", "1", "--per-species", "5"]
+        with patch.object(sys, "argv", argv), patch.object(select_paired, "head", return_value=(10**6, "e")), \
+                patch.object(select_paired, "ena_meta", side_effect=meta):
+            select_paired.main()
+        lines = (self.root / "sel" / "selection.tsv").read_text().splitlines()[1:]
+        self.assertEqual(sorted(l.split("\t")[0] for l in lines), ["S1", "S2"])
+        self.assertEqual(read_json(self.root / "sel" / "selection.json")["paired_biosamples_available"], 2)
 
     def ont_evidence_fixture(self, x, bam_records=None):
         reads = ["j1", "g1", "g2", "g3", "g4", "other"]

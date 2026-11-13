@@ -60,7 +60,7 @@ def main():
             arch = json.load(open(d / "archive.json")) if (d / "archive.json").is_file() else {}
             rows.append({"run": Path(sd).name, "sample": d.name, "status": json.load(open(d / "status.json"))["status"],
                          "job_id": job.get("job_id", ""), "download_bytes": sum(f["size_bytes"] for f in spec["files"]),
-                         "refseq_bytes": sum(r.get("size_bytes", 0) for r in down.get("refseqs", [])),
+                         "refseq_bytes": sum(r.get("size_bytes") or 0 for r in down.get("refseqs", [])),
                          "rule_wall_s": round(wall), "rule_cpu_s": round(cpu), "peak_scratch_gb": round(peak / 1e9, 2),
                          "peak_gb_reserved": spec["peak_gb"],
                          "archive_bytes": arch.get("bytes", arch.get("size_bytes", ""))})

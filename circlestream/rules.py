@@ -229,6 +229,25 @@ def circle_finder(x, stage):
         write_json(x.log / f"cf-{stage}-{index}.json", record)
 
 
+CRESIL_FAILED = "cresil_failed.json"
+
+
+def stderr_tail(x, rule, lines=3):
+    log = sorted(x.log.glob(f"{rule}.*.stderr.log"), key=lambda q: q.stat().st_mtime)
+    return log[-1].read_text(errors="replace").strip().splitlines()[-lines:] if log else []
+
+
+def cresil_failed(x, junctions, failure):
+    """Archive the junction-counter result with the CReSIL failure recorded (no partial CReSIL output)."""
+    for name in ("eccDNA_final.txt", "cresil_trace.tsv"):
+        (x.out / name).unlink(missing_ok=True)
+    write_json(x.state / "calls.json", {"caller": "ont_junctions+CReSIL",
+        "classification": "evidence categories, not topology proof",
+        "ont_junctions": junctions,
+        "cresil": {"mode": x.c["caller"]["cresil_mode"], "status": "failed", **failure},
+        "cresil_trace": {}, "candidate_count": None})
+
+
 def mapping(x):
     if x.out.exists():
         # Never mix a retried caller with partial output from an earlier attempt.
@@ -238,8 +257,16 @@ def mapping(x):
         circle_finder(x, "mapping")
         x.run(["samtools", "quickcheck", "-v", x.out / "sample-ref.sorted.bam"])
     else:
-        x.run(["cresil", "trim", "-t", max(4, x.cpus-2), "-fq", x.work/"prepared"/"reads.fa",
-               "-r", str(x.ref)+".mmi", "-o", x.out])
+        # trim is a CReSIL-only prerequisite. If it fails (e.g. OOM-killed), record the failure and
+        # let call() still run the independent junction scan instead of failing the sample.
+        try:
+            x.run(["cresil", "trim", "-t", max(4, x.cpus-2), "-fq", x.work/"prepared"/"reads.fa",
+                   "-r", str(x.ref)+".mmi", "-o", x.out])
+        except subprocess.CalledProcessError as error:
+            (x.out / "trim.txt").unlink(missing_ok=True)
+            write_json(x.out / CRESIL_FAILED, {"stage": "trim", "returncode": error.returncode,
+                                               "error_tail": stderr_tail(x, "mapping")})
+            return
         with (x.out / "trim.txt").open() as handle:
             reader = csv.DictReader(handle, delimiter="\t")
             if not {"readid", "q_start", "q_end", "ref", "r_start", "r_end"} <= set(reader.fieldnames or []):
@@ -269,22 +296,17 @@ def call(x):
         # CReSIL is the secondary, comparison caller. If it fails (e.g. a worker OOM-killed in a
         # deep library, seen in 3 of 1,440 samples at 24 GB), the junction-counter result is
         # still archived and the failure is recorded instead of discarding the whole sample.
+        if (x.out / CRESIL_FAILED).is_file():  # trim already failed in mapping()
+            cresil_failed(x, junctions, json.loads((x.out / CRESIL_FAILED).read_text()))
+            return
         try:
             x.run(["python", REPO/"scripts"/"cresil_wgls_checked.py", "-t", max(4,x.cpus-2), "-m", p["cresil_mode"],
                    "-r", str(x.ref)+".mmi", "-fa", x.ref, "-fai", str(x.ref)+".fai",
                    "-fq", x.work/"prepared"/"reads.fa", "-trim", x.out/"trim.txt",
                    "-minrsize", p["min_region_size"], "-break", p["breakpoint_depth"], "-depth", p["average_depth"]])
         except subprocess.CalledProcessError as error:
-            log = sorted(x.log.glob("call.*.stderr.log"), key=lambda q: q.stat().st_mtime)
-            tail = log[-1].read_text(errors="replace").strip().splitlines()[-3:] if log else []
-            for name in ("eccDNA_final.txt", "cresil_trace.tsv"):
-                (x.out / name).unlink(missing_ok=True)  # never archive a partial CReSIL result
-            write_json(x.state / "calls.json", {"caller": "ont_junctions+CReSIL",
-                "classification": "evidence categories, not topology proof",
-                "ont_junctions": junctions,
-                "cresil": {"mode": p["cresil_mode"], "status": "failed", "returncode": error.returncode,
-                           "error_tail": tail},
-                "cresil_trace": {}, "candidate_count": None})
+            cresil_failed(x, junctions, {"stage": "identify", "returncode": error.returncode,
+                                         "error_tail": stderr_tail(x, "call")})
             return
         with (x.out / "eccDNA_final.txt").open() as handle:
             reader = csv.DictReader(handle, delimiter="\t")
