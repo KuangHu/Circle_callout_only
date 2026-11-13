@@ -1385,6 +1385,16 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(hit("chr", 2850683, 2900186), [])   # same end, different start
         self.assertEqual(hit("pl2", 0, 5000), ["ec3"])
 
+    def test_span_match_microhomology_shift_is_rightward_only(self):
+        from scripts.cresil_trace import span_matches
+        # Junction stored at its left-most equivalent position (10000, 20000), 150 bp microhomology.
+        m = lambda s, e: span_matches("chr", 10000, 20000, 150, ("chr", s, e), tol=50, frac=0.001)  # noqa: E731
+        self.assertTrue(m(10150, 20150))     # equivalent breakpoint 150 bp to the right
+        self.assertTrue(m(10190, 20195))     # ... plus the ordinary tolerance
+        self.assertTrue(m(9960, 19960))      # within the ordinary tolerance to the left
+        self.assertFalse(m(9850, 19850))     # 150 bp to the left: a distinct upstream interval
+        self.assertFalse(m(10260, 20260))    # beyond microhomology + tolerance
+
     def test_config_rejects_unknown_ont_junction_key(self):
         c = dict(self.c, caller=dict(self.c["caller"], ont_junction={"min_reads": 3, "bogus": 1}))
         p = self.root / "cfg.json"; write_json(p, c)

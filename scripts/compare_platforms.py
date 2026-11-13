@@ -9,8 +9,9 @@ wins for a repeated BioSample (reruns). --illumina dirs hold <SID>_ill.tar.gz or
 Circle_finder archives; Illumina is optional cross-support, never a precondition.
 
 Matching (same contig): endpoints within max(tol, frac x length) of each other, OR shifted
-together along the junction's microhomology (|d_start - d_end| <= tol and |d_start| <=
-microhomology_bp + tol), since such junctions are indistinguishable.
+together along the junction's microhomology (|d_start - d_end| <= tol and -tol <= d_start <=
+microhomology_bp + tol), since such junctions are indistinguishable. ONT junctions are stored
+at the left-most equivalent position, so equivalent shifts are rightward only.
 
 Library QC (per sample, from evidence/cresil/contig_depth.tsv): breadth = fraction of the
 assembly in contigs with depth >= 0.1 x the assembly mean. Below --min-breadth the ONT library

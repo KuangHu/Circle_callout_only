@@ -57,14 +57,15 @@ def final_spans(path, gap=100):
 
 def span_matches(contig, start, end, mh, span, tol=50, frac=0.02):
     """Same rule as compare_platforms: ends within max(tol, frac x length), or shifted
-    together along the junction's microhomology."""
+    together along the junction's microhomology. ont_junctions.py stores the LEFT-most
+    equivalent breakpoint, so equivalent positions lie 0..mh bp to the right only."""
     if span[0] != contig:
         return False
     ds, de = span[1] - start, span[2] - end
     lim = max(tol, frac * max(end - start, span[2] - span[1]))
     if abs(ds) <= lim and abs(de) <= lim:
         return True
-    return abs(ds - de) <= tol and abs(ds) <= mh + tol
+    return abs(ds - de) <= tol and -tol <= ds <= mh + tol
 
 
 def main():
