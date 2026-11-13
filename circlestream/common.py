@@ -163,6 +163,13 @@ def load_config(path):
                "min_anchor", "edge", "dup_tolerance", "repeat_score_frac", "min_tandem_reads", "min_expected_flank"}
     if not isinstance(oj, dict) or set(oj) - allowed or any(not isinstance(v, (int, float)) or v < 0 for v in oj.values()):
         raise ValueError(f"caller.ont_junction must map {sorted(allowed)} to non-negative numbers")
+    cap = c["caller"].get("cresil_graph_read_cap", 50)
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 0:
+        raise ValueError("caller.cresil_graph_read_cap must be a non-negative integer")
+    if not isinstance(c.get("release_failed_raw", False), bool):
+        raise ValueError("release_failed_raw must be true or false")
+    if c.get("release_failed_raw") and c.get("download_mode", "dtn") != "slurm":
+        raise ValueError("release_failed_raw needs download_mode slurm (failed samples are re-fetched by fetch jobs)")
     if c.get("download_mode", "dtn") not in ("dtn", "slurm"):
         raise ValueError("download_mode must be dtn (DTN downloader) or slurm (1-CPU fetch jobs + node-local work)")
     if c.get("reference_store"):

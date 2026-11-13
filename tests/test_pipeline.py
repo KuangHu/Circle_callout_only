@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from circlestream.common import GB, REPO, S3_PART_SIZES, digest, s3_etag_matches, source_ok, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
-from circlestream.controller import admitted, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm, worker, submit_fetch, fetch_specs, reconcile_fetch, fetch_records
+from circlestream.controller import admitted, release_failed_raw, only_held_left, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm, worker, submit_fetch, fetch_specs, reconcile_fetch, fetch_records
 from circlestream.fastq import extract, materialize
 from circlestream.rules import Context, archive, cf_lines, convert_sra, copy_caller_evidence, library_depth
 from scripts.cresil_wgls_checked import execute, strict_call
@@ -552,6 +552,50 @@ class PipelineTests(unittest.TestCase):
         recover(c, "t0")
         self.assertEqual(status(state), "NEW")  # next fetch job resumes into the same owned scratch
 
+    def test_slurm_mode_release_failed_raw_frees_budget_and_recover_refetches(self):
+        c = self.slurm_mode(2); c["fetch"]["max_samples"] = 1; c["release_failed_raw"] = True
+        state, scratch = Path(c["state_dir"]) / "t0", Path(c["scratch_dir"]) / "t0"
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                fetch_specs([state / "spec.json"])
+        write_json(state / "job.json", {"job_id": "777"})
+        set_status(state, "COMPUTE_FAILED", error="scratch reservation exceeded")
+        c["scratch_budget_gb"] = 1.5 * self.raw.stat().st_size / GB
+        t1 = read_json(Path(c["state_dir"]) / "t1" / "spec.json")["sample"]
+        self.assertFalse(admitted(c, t1))           # held raw bytes still count against the budget
+        self.assertTrue(only_held_left(dict(c)) is False)
+        queue = lambda out: (lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))  # noqa: E731
+        with patch("circlestream.controller.subprocess.run", side_effect=queue("777\n")):
+            release_failed_raw(c)
+        self.assertTrue(scratch.exists())           # job still in the queue: untouched
+        with patch("circlestream.controller.subprocess.run", side_effect=queue("")):
+            release_failed_raw(c)
+        self.assertFalse(scratch.exists())
+        info = read_json(state / "status.json")
+        self.assertEqual((info["status"], info["raw_released"], info["error"]), ("COMPUTE_FAILED", True, "scratch reservation exceeded"))
+        self.assertTrue(admitted(c, t1))
+        recover(c, "t0")
+        self.assertEqual((status(state), read_json(state / "status.json")["raw_refetch"]), ("NEW", True))
+
+    def test_release_failed_raw_is_opt_in(self):
+        c = self.slurm_mode(1)
+        state, scratch = Path(c["state_dir"]) / "t0", Path(c["scratch_dir"]) / "t0"
+        scratch.mkdir(); set_status(state, "COMPUTE_FAILED")
+        with patch("circlestream.controller.subprocess.run", side_effect=AssertionError("no queue query")):
+            release_failed_raw(c)
+        self.assertTrue(scratch.exists())
+
+    def test_watch_stops_when_only_held_samples_remain(self):
+        c = self.slurm_mode(2)
+        set_status(Path(c["state_dir"]) / "t0", "CLEANED")
+        self.assertFalse(only_held_left(c))         # t1 is NEW
+        set_status(Path(c["state_dir"]) / "t1", "COMPUTE_FAILED")
+        self.assertTrue(only_held_left(c))
+        set_status(Path(c["state_dir"]) / "t1", "CLEANED")
+        self.assertFalse(only_held_left(c))         # all cleaned: the normal exit, not a held stop
+
     def test_slurm_mode_admission_uses_source_bytes_without_tree_walk(self):
         c = self.slurm_mode(1)
         c["scratch_budget_gb"] = self.raw.stat().st_size / GB / 2
@@ -1036,6 +1080,91 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((j["reads_input"], j["reads_in_paf"], j["reads_mapped_primary"]), (4, 2, 2))
         self.assertEqual((j["mapped_fraction"], j["aligned_base_fraction"], j["read_n50"]), (0.5, 0.5, 2000))
         self.assertIn("pl\t10000\t3000\t0.30", (self.root / "depth.tsv").read_text())
+
+    def ont_rule_context(self, cap=2):
+        x = SimpleNamespace(s={"platform": "nanopore", "reference": str(self.ref)}, spec={"reference_sha256": "0" * 64},
+                            c={"caller": {"cresil_mode": "linkage", "min_region_size": 200, "breakpoint_depth": 3,
+                                          "average_depth": 5, "cresil_graph_read_cap": cap}},
+                            cpus=4, ref=self.ref, state=self.root / "st", work=self.root / "w")
+        x.out, x.log = x.work / "caller", x.state / "logs"
+        for d in (x.out, x.log):
+            d.mkdir(parents=True, exist_ok=True)
+        (self.root / "ref.fa.fai").write_text("chr1\t400\t6\t400\t401\n")
+        return x
+
+    def test_ont_call_keeps_junction_result_when_cresil_fails(self):
+        from circlestream.rules import call
+        x = self.ont_rule_context()
+        (x.out / "eccDNA_final.txt").write_text("stale")
+        def run(args, **kw):
+            if any("cresil_wgls_checked.py" in str(a) for a in args):
+                (x.log / "call.1.1.stderr.log").write_text("worker OOM\nAttributeError: 'DataFrame' object has no attribute 'ovl_5end'\n")
+                raise subprocess.CalledProcessError(1, args)
+            raise AssertionError(f"nothing may run after a CReSIL failure: {args}")
+        x.run = run
+        with patch("circlestream.rules.ont_junctions", return_value={"junctions": 7}):
+            call(x)
+        j = read_json(x.state / "calls.json")
+        self.assertEqual(j["ont_junctions"], {"junctions": 7})
+        self.assertEqual((j["cresil"]["status"], j["candidate_count"]), ("failed", None))
+        self.assertIn("ovl_5end", j["cresil"]["error_tail"][-1])
+        self.assertFalse((x.out / "eccDNA_final.txt").exists())
+
+    def ont_evidence_fixture(self, x, bam_records=None):
+        reads = ["j1", "g1", "g2", "g3", "g4", "other"]
+        x.inputs = [self.root / "reads.fastq"]; fq(x.inputs[0], reads)
+        (x.out / "eccDNA_final.txt").write_text("id\tmerge_region\tmerge_len\tnum_region\tctc\tnumreads\n"
+                                                "ec1\tchr1:1-300_+\t300\t1\tTrue\t5\nec2\tchr1:1-50_+\t50\t1\tFalse\t1\n")
+        for gid, members in (("ec1", ["j1", "g1", "g2", "g3", "g4"]), ("ec2", ["other"])):
+            d = x.out / "cresil_run" / "assemGraph" / gid; d.mkdir(parents=True)
+            (d / "final_reads.fa").write_text("".join(f">{gid}_{r}_0_100\nACGT\n" for r in members))
+        (x.out / "ont_junction_ids.txt").write_text("j1\n")
+        (x.out / "trim.txt").write_text("readid\tq_start\nj1\t0\nother\t0\n")
+        def shell(code, **kw):
+            (x.work / "evidence" / "support.bam").write_bytes(b"bam")
+        def run(args, stdout=None, **kw):
+            if args[:3] == ["samtools", "view", "-c"]:
+                with gzip.open(x.work / "evidence" / "support_reads1.fastq.gz", "rt") as h:
+                    n = sum(1 for i, _ in enumerate(h) if i % 4 == 0)
+                Path(stdout).write_text(f"{n if bam_records is None else bam_records}\n")
+        x.shell, x.run = shell, run
+
+    def test_ont_evidence_caps_cyclic_graph_reads_and_keeps_bam_not_fastq(self):
+        from circlestream.rules import evidence
+        x = self.ont_rule_context(cap=2); self.ont_evidence_fixture(x)
+        evidence(x)
+        ev = x.work / "evidence"
+        ids = (ev / "read_ids.txt").read_text().split()
+        self.assertIn("j1", ids)                     # junction reads always kept (and ranked first in the graph)
+        self.assertEqual(len([r for r in ids if r.startswith("g")]), 1)  # cap 2 = j1 + one graph read
+        self.assertNotIn("other", ids)               # non-cyclic graph: IDs only
+        with gzip.open(ev / "cresil" / "graph_reads.tsv.gz", "rt") as h:
+            self.assertEqual(len(h.read().splitlines()), 1 + 6)  # every graph read ID retained
+        self.assertEqual(read_json(ev / "cresil" / "graph_read_sequences.json")["graphs"]["ec1"], {"reads": 5, "sequences_kept": 2})
+        self.assertFalse((ev / "support_reads1.fastq.gz").exists())
+        self.assertTrue((ev / "support.bam").is_file())
+        self.assertIn("samtools fastq -F 0x900", read_json(x.state / "evidence.json")["support_reads"])
+
+    def test_ont_evidence_refuses_to_drop_fastq_if_bam_is_incomplete(self):
+        from circlestream.rules import evidence
+        x = self.ont_rule_context(cap=2); self.ont_evidence_fixture(x, bam_records=1)
+        with self.assertRaisesRegex(ValueError, "primary records"):
+            evidence(x)
+
+    def test_ont_evidence_without_cresil_output_keeps_junction_reads(self):
+        from circlestream.rules import evidence, copy_caller_evidence
+        x = self.ont_rule_context(); self.ont_evidence_fixture(x)
+        shutil.rmtree(x.out / "cresil_run"); (x.out / "eccDNA_final.txt").unlink(); (x.out / "trim.txt").unlink()
+        evidence(x)
+        self.assertEqual((x.work / "evidence" / "read_ids.txt").read_text().split(), ["j1"])
+        self.assertEqual(read_json(x.work / "evidence" / "caller-retention.json")["support_trim_rows"], 0)
+
+    def test_config_validates_graph_cap_and_release_flag(self):
+        for bad in ({"caller": dict(self.c["caller"], cresil_graph_read_cap=-1)}, {"release_failed_raw": "yes"},
+                    {"release_failed_raw": True, "download_mode": "dtn"}):
+            p = self.root / "cfg.json"; write_json(p, dict(self.c, **bad))
+            with self.assertRaises(ValueError):
+                load_config(p)
 
     def test_cresil_trace_requires_spanning_entry_not_sub_unit_overlap(self):
         from scripts.cresil_trace import final_spans, span_matches

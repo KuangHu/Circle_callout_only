@@ -20,7 +20,9 @@ import urllib.error
 import urllib.request
 
 BUCKET = "https://sra-pub-run-odp.s3.amazonaws.com/sra"
-PEAK_FACTOR = {"illumina": 30, "nanopore": 20}
+# Nanopore: node-local peak / SRA object size over 1,039 completed 1 TB-run samples was median
+# 6.2x, p99 18x, max 20.6x; 10 of 1,440 failed at 20x (up to ~23x, in the call step).
+PEAK_FACTOR = {"illumina": 30, "nanopore": 30}
 PEAK_MIN_GB = 2
 
 

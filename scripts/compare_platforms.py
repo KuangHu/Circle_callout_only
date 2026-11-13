@@ -18,6 +18,9 @@ is not genome-wide (targeted / enriched / wrong assembly): kept and listed, but 
 are also given for QC-passing samples only. With --same-culture (same_culture.py), Illumina of a
 genome_mismatch pair is not used as cross-support (column left blank, as for no Illumina).
 
+CReSIL failures (calls.json cresil.status == failed) are listed: their junctions show
+cresil_match "none" because CReSIL produced nothing, not because it disagreed.
+
 Outputs
   ont_junctions.tsv  every ONT junction, all labels, with CReSIL trace outcome, Illumina
                      split-read support (0 = Illumina present, no matching call; blank = no
@@ -90,7 +93,8 @@ def main():
     rows, per = [], []
     for sid, path in sorted(ont.items()):
         m = read_members(path, {"j": "evidence/cresil/ont_junctions.tsv", "t": "evidence/cresil/cresil_trace.tsv",
-                                "e": "evidence/cresil/eccDNA_final.txt", "d": "evidence/cresil/contig_depth.tsv"})
+                                "e": "evidence/cresil/eccDNA_final.txt", "d": "evidence/cresil/contig_depth.tsv",
+                                "c": "metadata/calls.json"})
         if "j" not in m:
             per.append({"sample": sid, "status": "not a v3 ONT archive"}); continue
         junc, trace = tsv(m["j"]), {r["junction_id"]: r for r in tsv(m.get("t"))}
@@ -122,7 +126,8 @@ def main():
                              cresil_excluded_at=excl,
                              illumina_split_reads="" if icalls is None else max([c[3] for c in hit_i], default=0)))
         sr = [r for r in rows if r["sample"] == sid]
-        per.append({"sample": sid, "status": "ok", "library_qc": qc, "breadth": "" if breadth is None else round(breadth, 3),
+        cresil_status = json.loads(m["c"]).get("cresil", {}).get("status", "ok") if "c" in m else "unknown"
+        per.append({"sample": sid, "status": "ok", "library_qc": qc, "cresil_status": cresil_status, "breadth": "" if breadth is None else round(breadth, 3),
                     "same_culture": culture.get(sid, ""), "illumina": "yes" if icalls is not None else "no",
                     "junctions": len(sr),
                     "internal_ge3": sum(r["location"] != "whole_contig" and int(r["independent_molecules"]) >= 3 for r in sr),
@@ -153,6 +158,7 @@ def main():
     s = {"samples": sum(p["status"] == "ok" for p in per), "samples_with_illumina": sum(p.get("illumina") == "yes" for p in per),
          "samples_library_qc_pass": sum(p.get("library_qc") == "pass" for p in per),
          "library_qc_not_pass": {p["sample"]: f"{p['library_qc']} (breadth {p['breadth']})" for p in per if p.get("library_qc") not in (None, "pass")},
+         "cresil_failed_samples": sorted(p["sample"] for p in per if p.get("cresil_status") == "failed"),
          "same_culture": dict(collections.Counter(p.get("same_culture") or "not checked" for p in per if p["status"] == "ok")),
          "by_min_independent_molecules": {f">={t}": count(lambda r, t=t: ge(r, t)) for t in THRESHOLDS},
          "by_min_independent_molecules_qc_pass": {f">={t}": count(lambda r, t=t: qc_pass(r) and ge(r, t)) for t in THRESHOLDS},

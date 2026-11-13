@@ -91,8 +91,13 @@ def check_snapshot(c):
         raise ValueError("Configuration differs from init snapshot; create a separate benchmark run")
 
 
+def raw_released(state):
+    return bool(read_json(state / "status.json").get("raw_released"))
+
+
 def admitted(c, sample):
-    active = [p for p in entries(c) if status(p) not in ("NEW", "CLEANED")]
+    # Failed samples whose raw objects were released (release_failed_raw) hold no disk.
+    active = [p for p in entries(c) if status(p) not in ("NEW", "CLEANED") and not raw_released(p)]
     reserved = sum(read_json(p / "spec.json")["sample"]["peak_gb"] for p in active)
     # Held samples retain their full disk reservation, but do not monopolize slots.
     live = [p for p in active if status(p) not in HELD]
@@ -375,6 +380,51 @@ def reconcile_jobs(c):
             print(f"Held {state.name}: Slurm {terminal[jid]}; job slot released, scratch retained", flush=True)
 
 
+def only_held_left(c):
+    """True when no sample can progress without operator action (all CLEANED or held)."""
+    states = [status(p) for p in entries(c)]
+    return bool(states) and all(st == "CLEANED" or st in HELD for st in states) and any(st in HELD for st in states)
+
+
+def release_failed_raw(c):
+    """Opt-in (release_failed_raw, slurm mode). Held samples keep their raw objects on shared
+    staging, and those bytes count against scratch_budget_gb: in the 1 TB run, 32 failures held
+    43 GB and admission stalled. Once a COMPUTE_FAILED sample's job has left the queue, delete
+    its owned staging directory; `recover` then re-fetches (checksum-gated) instead of resuming."""
+    if not (local_mode(c) and c.get("release_failed_raw")):
+        return
+    failed = [p for p in entries(c) if status(p) == "COMPUTE_FAILED" and not raw_released(p)]
+    if not failed:
+        return
+    try:
+        queue = subprocess.run(["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
+                               check=True, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Queue unavailable; not releasing failed raw: {error}", file=sys.stderr, flush=True)
+        return
+    live = set(queue.stdout.split())
+    root = Path(c["scratch_dir"]).resolve()
+    for state in failed:
+        if any((state / name).exists() for name in (".worker-lock", ".cleanup-lock")):
+            continue
+        job = state / "job.json"
+        if job.exists() and read_json(job)["job_id"] in live:
+            continue  # the worker may still be finishing on its node
+        scratch = Path(c["scratch_dir"]) / state.name
+        if scratch.exists():
+            spec = read_json(state / "spec.json")
+            if (scratch.is_symlink() or scratch.resolve().parent != root
+                    or read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}
+                    or any(p.is_symlink() for p in scratch.rglob("*"))):
+                print(f"Not releasing {state.name}: scratch ownership/symlink check failed", file=sys.stderr, flush=True)
+                continue
+            shutil.rmtree(scratch)
+        info = read_json(state / "status.json")
+        info.pop("updated", None)
+        set_status(state, info.pop("status"), raw_released=True, **info)
+        print(f"Released raw staging of failed {state.name}; recover re-fetches it", flush=True)
+
+
 def cleanup_archived(c):
     """Isolate cleanup failures so a single sample cannot terminate the watcher."""
     for state in entries(c):
@@ -623,6 +673,9 @@ def recover(c, sid):
             except Exception as error:
                 set_status(state, "DOWNLOAD_FAILED", error=str(error))
                 raise
+    elif current == "COMPUTE_FAILED" and raw_released(state):
+        # Raw objects were released: download again through a fetch job, then rerun.
+        set_status(state, "NEW", recovered_from="COMPUTE_FAILED", raw_refetch=True)
     elif current in ("COMPUTE_FAILED", "PAUSED", "RUNNING", "SUBMITTING"):
         job = state / "job.json"
         if not job.exists():
@@ -700,6 +753,8 @@ def main():
         try:
             if a.command == "submit" and c["auto_cleanup"]:
                 cleanup_archived(c)
+            if a.command == "submit":
+                release_failed_raw(c)
             if a.command == "download":
                 progressed = download_one(c, a.sample)
             else:
@@ -713,6 +768,10 @@ def main():
         if not a.watch:
             break
         if all(status(p) == "CLEANED" for p in entries(c)):
+            break
+        if a.command == "submit" and only_held_left(c):
+            held = sum(status(p) in HELD for p in entries(c))
+            print(f"Nothing left to run: {held} held sample(s) need review/recover; exiting watch", flush=True)
             break
         if not progressed:
             counts = {}

@@ -266,10 +266,26 @@ def call(x):
         (x.out / "eccDNA_final.txt").unlink(missing_ok=True)
         p = x.c["caller"]
         junctions = ont_junctions(x)  # genome-wide scan first: independent of CReSIL's outcome
-        x.run(["python", REPO/"scripts"/"cresil_wgls_checked.py", "-t", max(4,x.cpus-2), "-m", p["cresil_mode"],
-               "-r", str(x.ref)+".mmi", "-fa", x.ref, "-fai", str(x.ref)+".fai",
-               "-fq", x.work/"prepared"/"reads.fa", "-trim", x.out/"trim.txt",
-               "-minrsize", p["min_region_size"], "-break", p["breakpoint_depth"], "-depth", p["average_depth"]])
+        # CReSIL is the secondary, comparison caller. If it fails (e.g. a worker OOM-killed in a
+        # deep library, seen in 3 of 1,440 samples at 24 GB), the junction-counter result is
+        # still archived and the failure is recorded instead of discarding the whole sample.
+        try:
+            x.run(["python", REPO/"scripts"/"cresil_wgls_checked.py", "-t", max(4,x.cpus-2), "-m", p["cresil_mode"],
+                   "-r", str(x.ref)+".mmi", "-fa", x.ref, "-fai", str(x.ref)+".fai",
+                   "-fq", x.work/"prepared"/"reads.fa", "-trim", x.out/"trim.txt",
+                   "-minrsize", p["min_region_size"], "-break", p["breakpoint_depth"], "-depth", p["average_depth"]])
+        except subprocess.CalledProcessError as error:
+            log = sorted(x.log.glob("call.*.stderr.log"), key=lambda q: q.stat().st_mtime)
+            tail = log[-1].read_text(errors="replace").strip().splitlines()[-3:] if log else []
+            for name in ("eccDNA_final.txt", "cresil_trace.tsv"):
+                (x.out / name).unlink(missing_ok=True)  # never archive a partial CReSIL result
+            write_json(x.state / "calls.json", {"caller": "ont_junctions+CReSIL",
+                "classification": "evidence categories, not topology proof",
+                "ont_junctions": junctions,
+                "cresil": {"mode": p["cresil_mode"], "status": "failed", "returncode": error.returncode,
+                           "error_tail": tail},
+                "cresil_trace": {}, "candidate_count": None})
+            return
         with (x.out / "eccDNA_final.txt").open() as handle:
             reader = csv.DictReader(handle, delimiter="\t")
             if not {"id", "ctc", "merge_region", "numreads"} <= set(reader.fieldnames or []):
@@ -285,7 +301,7 @@ def call(x):
         write_json(x.state / "calls.json", {"caller": "ont_junctions+CReSIL",
             "classification": "evidence categories, not topology proof",
             "ont_junctions": junctions,
-            "cresil": {"mode": p["cresil_mode"], "cyclic_graphs": sum(r["ctc"] == "True" for r in rows), "all_graphs": len(rows)},
+            "cresil": {"mode": p["cresil_mode"], "status": "ok", "cyclic_graphs": sum(r["ctc"] == "True" for r in rows), "all_graphs": len(rows)},
             "cresil_trace": {f"{k[0]}/{k[1]}": v for k, v in sorted(trace.items())},
             # Backwards-compatible field: CReSIL cyclic graphs.
             "candidate_count": sum(r["ctc"] == "True" for r in rows)})
@@ -413,7 +429,7 @@ def copy_caller_evidence(out, ev, platform, wanted):
         else:
             omitted_bytes += p.stat().st_size
     trim_rows = 0
-    if platform == "nanopore":
+    if platform == "nanopore" and (out / "trim.txt").is_file():  # absent when CReSIL failed early
         dest = ev / "cresil" / "trim.support.txt"
         dest.parent.mkdir(parents=True, exist_ok=True)
         with (out / "trim.txt").open() as source, dest.open("w", newline="") as target:
@@ -457,6 +473,15 @@ def evidence(x):
         if (x.out / "eccDNA_final.txt").is_file():
             with (x.out / "eccDNA_final.txt").open() as handle:
                 cyclic = {r["id"] for r in csv.DictReader(handle, delimiter="\t") if r["ctc"] == "True"}
+        junction_ids = x.out / "ont_junction_ids.txt"
+        if junction_ids.is_file():  # reads behind every junction cluster, whatever its label: all kept
+            wanted.update(l.strip() for l in junction_ids.open() if l.strip())
+        # A cyclic graph over a high-copy replicon can hold most of the library (99% of the
+        # support reads in the largest 1 TB-run archives). All graph read IDs go to
+        # graph_reads.tsv.gz; sequences are kept for at most `cap` reads per cyclic graph,
+        # chosen deterministically (junction reads first, then by a hash of the read ID).
+        cap = int(x.c["caller"].get("cresil_graph_read_cap", 50))
+        members = collections.defaultdict(set)
         (ev / "cresil").mkdir(parents=True, exist_ok=True)
         with gzip.open(ev / "cresil" / "graph_reads.tsv.gz", "wt") as table:
             table.write("graph_id\tcyclic\tread_id\tq_start\tq_end\n")
@@ -469,11 +494,16 @@ def evidence(x):
                             gid, rest = header.split("_", 1)
                             rid, qs, qe = rest.rsplit("_", 2)
                             table.write(f"{gid}\t{gid in cyclic}\t{rid}\t{qs}\t{qe}\n")
-                            if gid in cyclic:  # sequences only for cyclic graphs
-                                wanted.add(rid)
-        junction_ids = x.out / "ont_junction_ids.txt"
-        if junction_ids.is_file():  # reads behind every junction cluster, whatever its label
-            wanted.update(l.strip() for l in junction_ids.open() if l.strip())
+                            if gid in cyclic:
+                                members[gid].add(rid)
+        junction_reads = set(wanted)
+        graph_kept = {}
+        for gid in sorted(members):
+            ranked = sorted(members[gid], key=lambda r: (r not in junction_reads, hashlib.sha256(r.encode()).hexdigest()))
+            keep = ranked[:cap]
+            wanted.update(keep)
+            graph_kept[gid] = {"reads": len(members[gid]), "sequences_kept": len(keep)}
+        write_json(ev / "cresil" / "graph_read_sequences.json", {"cap_per_cyclic_graph": cap, "graphs": graph_kept})
         (ev / "read_ids.txt").write_text("".join(n+"\n" for n in sorted(wanted)))
     copy_caller_evidence(x.out, ev, x.s["platform"], wanted)
     counts = extract(x.inputs, wanted, ev, x.s["platform"])
@@ -482,7 +512,19 @@ def evidence(x):
         q = shlex.quote
         if wanted:
             x.shell(f"minimap2 -ax map-ont --secondary=yes -t {max(1,x.cpus-2)} {q(str(x.ref))} {q(str(ev/'support_reads1.fastq.gz'))} | samtools sort -@ 1 -o {q(str(ev/'support.bam'))}")
+            # Every read has exactly one primary (or unmapped) record carrying its full sequence
+            # and qualities, so the FASTQ is redundant (about half the archive). Verify before
+            # removing: `samtools fastq -F 0x900 support.bam` recovers it.
+            with gzip.open(ev / "support_reads1.fastq.gz", "rt") as handle:
+                fastq_reads = sum(1 for i, _ in enumerate(handle) if i % 4 == 0)
+            count = x.work / "support.primary.count"
+            x.run(["samtools", "view", "-c", "-F", "0x900", ev / "support.bam"], stdout=count)
+            primary = int(count.read_text().strip()); count.unlink()
+            if primary != fastq_reads:
+                raise ValueError(f"support.bam primary records ({primary}) != support reads ({fastq_reads})")
+            (ev / "support_reads1.fastq.gz").unlink()
         else:
+            (ev / "support_reads1.fastq.gz").unlink(missing_ok=True)
             (ev / "empty.sam").write_text("@HD\tVN:1.6\tSO:coordinate\n" + "".join(
                 f"@SQ\tSN:{a[0]}\tLN:{a[1]}\n" for a in (l.split("\t") for l in Path(str(x.ref)+".fai").read_text().splitlines())))
             x.run(["samtools", "view", "-b", "-o", ev/"support.bam", ev/"empty.sam"])
@@ -503,7 +545,8 @@ def evidence(x):
         shutil.copy2(p, dest)
     write_json(x.state / "evidence.json", {"read_ids": len(wanted), "records_per_file": counts,
         "bytes_before_archive": sum(p.stat().st_size for p in ev.rglob("*") if p.is_file()),
-        "scope": "all split/discordant read IDs" if x.s["platform"]=="illumina" else "all junction-counter reads (every junction, any label) + reads of CReSIL cyclic graphs; read IDs of all graphs in cresil/graph_reads.tsv.gz",
+        "scope": "all split/discordant read IDs" if x.s["platform"]=="illumina" else "all junction-counter reads (every junction, any label) + up to cresil_graph_read_cap reads per CReSIL cyclic graph (cresil/graph_read_sequences.json); read IDs of all graphs in cresil/graph_reads.tsv.gz",
+        **({} if x.s["platform"] == "illumina" else {"support_reads": "support.bam only: samtools fastq -F 0x900 support.bam recovers every support read with qualities"}),
         "limitation": "Original full-library alternatives require re-download; no physical-topology validation is claimed"})
 
 
