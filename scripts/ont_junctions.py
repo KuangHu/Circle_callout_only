@@ -153,18 +153,31 @@ def is_unique(seg, secondaries, min_mapq, frac):
 
 def events_for_read(prim, sec, o):
     prim = sorted(prim, key=lambda s: (s["qs"], s["qe"]))
-    out = []
+    # Chains: consecutive segments on one contig and strand without a large read gap (the
+    # condition for an event below). The molecule's cut ends are where the chain starts and stops
+    # on the reference. Every pass of a multipass read shares them; using each pass's own segment
+    # ends (or their min/max, always the whole unit) would make distinct multipass reads of a
+    # small circle look like duplicates of one another.
+    chain = [0]
     for a, b in zip(prim, prim[1:]):
-        if a["contig"] != b["contig"] or a["strand"] != b["strand"] or abs(b["qs"] - a["qe"]) > o.max_qgap:
+        same = a["contig"] == b["contig"] and a["strand"] == b["strand"] and abs(b["qs"] - a["qe"]) <= o.max_qgap
+        chain.append(chain[-1] + (not same))
+    first, last = {}, {}
+    for s, c in zip(prim, chain):
+        first.setdefault(c, s); last[c] = s
+    out = []
+    for i, (a, b) in enumerate(zip(prim, prim[1:])):
+        if chain[i] != chain[i + 1]:
             continue
+        f, l = first[chain[i]], last[chain[i]]
         if a["strand"] == "+":
             start, end = b["ts"], a["te"]       # read: ... -> X = a.te, then continues at Y = b.ts
             at_x, at_y = a, b                   # segment ending at X / segment starting at Y
-            mol = (a["ts"], b["te"])            # where the read starts and stops on the reference
+            mol = (f["ts"], l["te"])            # where the read starts and stops on the reference
         else:
             start, end = a["ts"], b["te"]       # mirrored: a starts (ref) at Y, b ends at X
             at_x, at_y = b, a
-            mol = (a["te"], b["ts"])
+            mol = (f["te"], l["ts"])
         if end - start < o.min_circle:
             continue                            # indel split or forward jump, not a back-jump
         ua = is_unique(a, sec, o.min_mapq, o.repeat_score_frac)
@@ -217,9 +230,9 @@ def microhomology(seq, start, end, limit=200):
 
 def molecules(members, tol):
     """Group events into physical molecules. All events of one read are ONE molecule first (a
-    read crossing the junction twice yields two events with different coordinates, but is a
-    single observation); reads are then merged when their reference start/stop agree within
-    tol (duplex strands, duplicate records)."""
+    read crossing the junction twice yields two events but is a single observation); reads are
+    then merged when their reference start/stop (events_for_read: the chain's cut ends, shared
+    by every pass) agree within tol (duplex strands, duplicate records)."""
     by_read = collections.defaultdict(list)
     for e in members:
         by_read[e["read"]].append(e)

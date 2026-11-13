@@ -1054,6 +1054,25 @@ class PipelineTests(unittest.TestCase):
         self.assertNotEqual(r["label"], "tandem_supported")
         self.assertEqual((r["multipass_molecules"], r["support_ge3"]), ("1", "no"))
 
+    def test_ont_junction_distinct_multipass_reads_of_a_small_circle_stay_distinct(self):
+        # 2 kb circle [10000,12000); each read passes the junction twice, starting and stopping at
+        # its own positions. The min/max over passes is always the whole unit, so a key built from
+        # it would merge all of them; the chain's cut ends keep them apart. r0c is r0's other strand.
+        reads = self.long_background()
+        for i in range(4):
+            c, e = 10500 + 97 * i, 10300 + 113 * i
+            la, lb = 12000 - c, e - 10000
+            reads.append((f"r{i}", la + 2000 + lb, [(0, la, "+", "chr1", c, 12000), (la, la + 2000, "+", "chr1", 10000, 12000),
+                                                     (la + 2000, la + 2000 + lb, "+", "chr1", 10000, e)]))
+        c, e = 10500, 10300; la, lb = 12000 - c, e - 10000
+        reads.append(("r0c", la + 2000 + lb, [(0, lb, "-", "chr1", 10000, e), (lb, lb + 2000, "-", "chr1", 10000, 12000),
+                                              (lb + 2000, lb + 2000 + la, "-", "chr1", c, 12000)]))
+        rows, events, _ = self.junctions(reads)
+        r = rows[0]
+        self.assertEqual(sum(e["read"] == "r1" for e in events), 2)
+        self.assertEqual((r["junction_reads"], r["independent_molecules"], r["multipass_molecules"]), ("5", "4", "4"))
+        self.assertEqual((r["support_ge3"], r["label"]), ("yes", "junction_supported"))
+
     def test_ont_junction_repeat_or_short_anchors_are_ambiguous(self):
         reads = self.long_background()
         for i in range(5):  # anchor a has an equally good secondary alignment elsewhere
