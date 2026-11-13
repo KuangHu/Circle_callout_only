@@ -13,9 +13,10 @@ import sys
 import tarfile
 import time
 
-from .common import (GB, REPO, digest, fingerprint, load_config, lock, read_json,
+from .common import (GB, REPO, digest, fingerprint, is_sra, load_config, lock, read_json,
                      local_mode, safe_id, set_status, source_ok, state_paths, tree_size, validate_sample, work_root,
                      write_json, workflow_fingerprint)
+from .sra import fetch_refseqs, stage_refseqs
 
 ACTIVE_JOBS = {"SUBMITTING", "QUEUED", "RUNNING"}
 HELD = {"DOWNLOAD_FAILED", "COMPUTE_FAILED", "CLEANUP_FAILED"}
@@ -90,14 +91,30 @@ def check_snapshot(c):
         raise ValueError("Configuration differs from init snapshot; create a separate benchmark run")
 
 
+def dependency_bytes(state):
+    """Bytes of refseq dependencies a fetch job staged for this sample (0 until recorded)."""
+    d = state / "download.json"
+    if not d.is_file():
+        return 0
+    return sum(r.get("size_bytes") or 0 for r in read_json(d).get("refseqs", []))
+
+
+def raw_released(state):
+    return bool(read_json(state / "status.json").get("raw_released"))
+
+
 def admitted(c, sample):
-    active = [p for p in entries(c) if status(p) not in ("NEW", "CLEANED")]
+    # Failed samples whose raw objects were released (release_failed_raw) hold no disk.
+    active = [p for p in entries(c) if status(p) not in ("NEW", "CLEANED") and not raw_released(p)]
     reserved = sum(read_json(p / "spec.json")["sample"]["peak_gb"] for p in active)
     # Held samples retain their full disk reservation, but do not monopolize slots.
     live = [p for p in active if status(p) not in HELD]
     if local_mode(c):
         # Shared scratch only holds source objects; node-local disk holds the work.
         raw = sum(f["size_bytes"] for p in active for f in read_json(p / "spec.json")["sample"]["files"])
+        # Aligned SRA runs also stage refseq dependencies beside the object; their sizes are only
+        # known once fetched (download.json), so charge them from then on.
+        raw += sum(dependency_bytes(p) for p in active)
         need = sum(f["size_bytes"] for f in sample["files"])
         if len(live) >= c["max_active_samples"] or (raw + need) / GB > c["scratch_budget_gb"]:
             return False
@@ -160,16 +177,22 @@ def claim_scratch(state, scratch, spec):
     (scratch / "raw").mkdir(exist_ok=True)
 
 
-def fetch_inputs(c, sample, state, scratch):
-    """Download (or resume) source files into owned scratch and record timing."""
+def fetch_inputs(c, sample, state, scratch, **extra):
+    """Download (or resume) source files and SRA refseq dependencies into owned scratch and
+    record timing. Every download path (fetch job, DTN, DTN resume) goes through here."""
     start = time.time()
+    refseqs = []
     for item in sample["files"]:
         download_file(item, scratch / "raw", c["download_retries"])
+        if is_sra(item):
+            # Aligned-read runs need their reference sequences beside the object (see sra.py).
+            refseqs += fetch_refseqs(scratch / "raw" / item["name"], c["download_retries"])
     write_json(state / "download.json", {
+        "refseqs": refseqs,
         "seconds": time.time() - start,
         "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
         "host": socket.getfqdn(), "in_job": bool(os.environ.get("SLURM_JOB_ID")),
-        "files": sample["files"]
+        "files": sample["files"], **extra
     })
 
 
@@ -369,6 +392,65 @@ def reconcile_jobs(c):
             print(f"Held {state.name}: Slurm {terminal[jid]}; job slot released, scratch retained", flush=True)
 
 
+def only_held_left(c):
+    """True when no sample can progress without operator action (all CLEANED or held)."""
+    states = [status(p) for p in entries(c)]
+    return bool(states) and all(st == "CLEANED" or st in HELD for st in states) and any(st in HELD for st in states)
+
+
+def release_failed_raw(c):
+    """Opt-in (release_failed_raw, slurm mode). Held samples keep their raw objects on shared
+    staging, and those bytes count against scratch_budget_gb: in the 1 TB run, 32 failures held
+    43 GB and admission stalled. Once a COMPUTE_FAILED sample's job has left the queue, delete
+    its owned staging directory; `recover` then re-fetches (checksum-gated) instead of resuming.
+
+    Returns the number of failed samples whose release is deferred (worker still finishing, job
+    still queued, or a concurrent recover holding the sample's .release-lock), so the watcher
+    keeps running until they can be released."""
+    if not (local_mode(c) and c.get("release_failed_raw")):
+        return 0
+    failed = [p for p in entries(c) if status(p) == "COMPUTE_FAILED" and not raw_released(p)]
+    if not failed:
+        return 0
+    try:
+        queue = subprocess.run(["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
+                               check=True, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Queue unavailable; not releasing failed raw: {error}", file=sys.stderr, flush=True)
+        return len(failed)
+    live = set(queue.stdout.split())
+    root = Path(c["scratch_dir"]).resolve()
+    deferred = 0
+    for state in failed:
+        try:
+            # recover() takes the same per-sample lock, so the status cannot change between
+            # these checks and the deletion (no READY + new worker on a deleted directory).
+            with lock(state / ".release-lock"):
+                if status(state) != "COMPUTE_FAILED" or raw_released(state):
+                    continue
+                job = state / "job.json"
+                if (any((state / name).exists() for name in (".worker-lock", ".cleanup-lock"))
+                        or (job.exists() and read_json(job)["job_id"] in live)):
+                    deferred += 1  # the worker may still be finishing on its node
+                    continue
+                scratch = Path(c["scratch_dir"]) / state.name
+                if scratch.exists():
+                    spec = read_json(state / "spec.json")
+                    if (scratch.is_symlink() or scratch.resolve().parent != root
+                            or read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}
+                            or any(p.is_symlink() for p in scratch.rglob("*"))):
+                        print(f"Not releasing {state.name}: scratch ownership/symlink check failed", file=sys.stderr, flush=True)
+                        continue
+                    shutil.rmtree(scratch)
+                info = read_json(state / "status.json")
+                info.pop("updated", None)
+                set_status(state, info.pop("status"), raw_released=True, **info)
+                print(f"Released raw staging of failed {state.name}; recover re-fetches it", flush=True)
+        except RuntimeError:
+            deferred += 1  # .release-lock held by a concurrent recover
+    return deferred
+
+
 def cleanup_archived(c):
     """Isolate cleanup failures so a single sample cannot terminate the watcher."""
     for state in entries(c):
@@ -441,12 +523,15 @@ def stage_local(c, sid, inputs):
         set_status(state,"DOWNLOADING")
         start=time.time()
         try:
+            refseqs = []
             for source,item in zip(inputs,sample["files"]):
                 target=scratch / "raw" / item["name"]
                 shutil.copy2(source,target)
                 if not source_ok(target, item):
                     raise ValueError("Staged input checksum mismatch")
-            write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,
+                if is_sra(item):  # aligned runs: refseqs beside the source, else fetched
+                    refseqs += stage_refseqs(source, target, c["download_retries"])
+            write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,"refseqs":refseqs,
                 "compressed_bytes":sum(f["size_bytes"] for f in sample["files"])})
             set_status(state,"READY")
         except Exception as error:
@@ -589,6 +674,16 @@ def cleanup(c, sid):
 
 def recover(c, sid):
     """Explicit operator action, not automatic retry of ambiguous Slurm submissions."""
+    state, _ = state_paths(c, sid)
+    if status(state) == "COMPUTE_FAILED":
+        # Serialize with release_failed_raw: it must not delete staging that this recovery is
+        # about to hand to a new worker, and recovery must see whether raw was released.
+        with lock(state / ".release-lock"):
+            return _recover(c, sid)
+    return _recover(c, sid)
+
+
+def _recover(c, sid):
     state, scratch = state_paths(c, sid)
     current = status(state)
     for name in (".worker-lock", ".cleanup-lock"):
@@ -607,16 +702,15 @@ def recover(c, sid):
             if read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}:
                 raise ValueError("Ownership mismatch")
             set_status(state, "DOWNLOADING")
-            start = time.time()
             try:
-                for item in spec["sample"]["files"]:
-                    download_file(item, scratch / "raw", c["download_retries"])
-                write_json(state / "download.json", {"seconds": time.time()-start, "resumed": True,
-                    "compressed_bytes": sum(f["size_bytes"] for f in spec["sample"]["files"])})
+                fetch_inputs(c, spec["sample"], state, scratch, resumed=True)  # incl. SRA refseqs
                 set_status(state, "READY")
             except Exception as error:
                 set_status(state, "DOWNLOAD_FAILED", error=str(error))
                 raise
+    elif current == "COMPUTE_FAILED" and raw_released(state):
+        # Raw objects were released: download again through a fetch job, then rerun.
+        set_status(state, "NEW", recovered_from="COMPUTE_FAILED", raw_refetch=True)
     elif current in ("COMPUTE_FAILED", "PAUSED", "RUNNING", "SUBMITTING"):
         job = state / "job.json"
         if not job.exists():
@@ -691,9 +785,12 @@ def main():
         {"cleanup":cleanup,"recover":recover,"verify":reconcile_archive}[a.command](c, a.sample)
         return
     while True:
+        deferred = 0
         try:
             if a.command == "submit" and c["auto_cleanup"]:
                 cleanup_archived(c)
+            if a.command == "submit":
+                deferred = release_failed_raw(c)
             if a.command == "download":
                 progressed = download_one(c, a.sample)
             else:
@@ -707,6 +804,10 @@ def main():
         if not a.watch:
             break
         if all(status(p) == "CLEANED" for p in entries(c)):
+            break
+        if a.command == "submit" and only_held_left(c) and not deferred:
+            held = sum(status(p) in HELD for p in entries(c))
+            print(f"Nothing left to run: {held} held sample(s) need review/recover; exiting watch", flush=True)
             break
         if not progressed:
             counts = {}

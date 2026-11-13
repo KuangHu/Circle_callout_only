@@ -17,7 +17,7 @@
 - 必须显式提供未压缩 reference。v0.1 **不自动组装、不选择参考、不发现参考外序列**。含 IS 的 reference 可以来自独立样本组装，不需要 insertion catalog。
 - RCA/enriched/ATAC、PacBio、单端 Illumina、低于 75 bp 的普通 WGS 不混入本配置。
 - 已做 adapter trimming 的 Illumina：默认 `caller.short_read_policy="reject"` 拒绝含 <75 bp reads 的样本；设为 `"drop_pair"` 时任一 mate <75 bp 则整对丢弃，其余 reads 保持原长度，`qc.json` 记录总/丢弃/保留 pairs 和保留碱基。FASTQ 截断、配对 ID、质量长度等错误仍然报错。过滤会去掉部分短片段信号，结果需注明该策略。
-- 数据源：ENA HTTPS 在 LRC 实测每连接约 0.7–2.5 MB/s 且整体被限速；NCBI SRA 的 AWS 公开桶（`https://sra-pub-run-odp.s3.amazonaws.com/sra/<run>/<run>`）实测单连接 12–18 MB/s、8 连接 41–55 MB/s。manifest 中可用 `<run>.sra` 单文件条目（`size_bytes` + `s3_etag`，由 `scripts/sra_manifest.py` 通过 HEAD 生成）；下载后校验 S3 multipart ETag，preflight 再跑 `vdb-validate`，qc 用 `fasterq-dump --split-3`（临时文件在节点本地 /tmp）转 FASTQ，Illumina 无配对的 reads 丢弃并记录。需要在 control env 安装 `sra-tools`。
+- 数据源：ENA HTTPS 在 LRC 实测每连接约 0.7–2.5 MB/s 且整体被限速；NCBI SRA 的 AWS 公开桶（`https://sra-pub-run-odp.s3.amazonaws.com/sra/<run>/<run>`）实测单连接 12–18 MB/s、8 连接 41–55 MB/s。manifest 中可用 `<run>.sra` 单文件条目（`size_bytes` + `s3_etag`，由 `scripts/sra_manifest.py` 通过 HEAD 生成）；下载后校验 S3 multipart ETag，preflight 再跑 `vdb-validate`，qc 用 `fasterq-dump --split-3`（临时文件在节点本地 /tmp）转 FASTQ，Illumina 无配对的 reads 丢弃并记录。需要在 control env 安装 `sra-tools`。以比对形式提交的 run（如 BAM 上传）依赖外部参考序列（refseq）；fasterq-dump 找不到时会联网下载，在计算节点上可能无限挂起。因此下载作业用 `align-info` 列出依赖，把每个 refseq 从 NCBI 下载到 `.sra` 同目录（`vdb-validate` 校验），并记入 download.json；preflight 确认全部依赖已在本地，qc 在断网（`unshare -rn`，节点支持时）和 `sra_conversion_timeout_minutes`（默认 60）限制下转换，超时即失败而不是占满作业时限。
 - `download_mode`：`"dtn"`（默认：DTN 上 `download --watch` + 登录节点 `submit --watch`）或 `"slurm"`（只需在登录节点用 tmux 保持一个 `submit --watch`；它自动提交 1 核下载作业和计算作业，**不再需要 DTN 的 `download --watch`**）。slurm 模式下：
   - 下载：最多 `fetch.max_jobs` 个 1 核作业并发；每个作业逐个下载，样本按空闲 fetch 槽位均分，且不超过 `fetch.max_samples` 个、`fetch.batch_gb` GB。实际供给速度需按批次实测，不能只用 `max_jobs × 单流速度` 推算。
   - 暂存：`scratch_dir` 只放下载的源文件，预算按源文件字节计入 `scratch_budget_gb`。Lustre 元数据延迟高时（实测每次操作 4–30 s），请把暂存目录放在 VAST 组目录。
@@ -56,7 +56,17 @@ python scripts/check_dag.py
 
 在管理员允许联网安装软件的节点执行安装。安装脚本创建三个独立 conda environments；已存在的环境不会自动覆盖。使用其他环境名时同步修改 config 的 command prefixes。
 
-- Circle_finder 固定到 `3eb333db2ea6277dde36cbf640be9afeb710c717`；原始 MIT 源码和许可证在 `third_party/`。
+- ONT 主线（v3，`scripts/ont_junctions.py`）：全基因组独立扫描 circularization junction，不依赖 CReSIL、insertion calling 或 Illumina 位点。同一 read 相邻两段比对在同一 contig、同一链上“回跳”（到达 X 后从 Y<X 继续）即一次 junction 事件，候选单元 [Y, X)；不要求 read 覆盖整个环，也不要求绕圈两次。比对：`minimap2 -c -x map-ont --secondary=yes -N 5 -p 0.9`，次级比对只用于标记重复/多重比对歧义。
+  - 每个事件记录两侧锚定长度、mapq、是否唯一（mapq≥20 且无 ≥0.9×得分的次级比对）、伸出单元外的长度（同一比对从 junction 连到外侧序列）、两段重叠长度；全部写入 `ont_junction_events.tsv`（原始坐标、归属）。长 read 穿过 tandem 时 minimap2 常把多出的一份写成 CIGAR 插入：唯一比对上长度≈X−Y、位置在 [Y, X] 内、并伸出 ≥100 bp 外侧的插入也计为 tandem 分子（`insertion_tandem_molecules`）。
+  - 聚类按滚动中位端点（容差 50 bp）；再用参考序列把微同源等价断点左对齐后合并，`raw_clusters` 保留原始簇及坐标。独立分子：同一 read 的所有事件先合并为一个分子（多次绕环的 read 只算一次）；再把参考上起止位置（该 read 比对链的两端，所有圈共用）相差 ≤10 bp 的 read（如 duplex 正反链、重复记录）合并；阈值都用 `independent_molecules`，且它永远不超过 `junction_reads`。限制：比读长短的小复制子/小环上，read 两端未比对上的残圈使比对链两端常落在单元边界（0, L），不同 read 会被当作重复合并，所以这里 `independent_molecules` 是保守下限（1 TB 试跑 200 样本：≥3 条不同 read 但 <3 个分子的 junction，internal 34/273，whole_contig 107/531）；同时报告 `junction_reads`。
+  - 标签（证据类别，不是拓扑证明）：`tandem_supported`（≥2 个独立分子把 junction 连到唯一外侧序列；不排除同一样本同时有环）、`junction_supported`（≥1 个分子两侧锚定均唯一且 ≥300 bp）、`ambiguous`（只有重复/多重比对或短锚定）。`circle_compatible` 只是一列：没有任何分子连到外侧、且按本文库读长若为 tandem 应看到 ≥3 个时为 yes——“兼容”，不是 confirmed circle。单条越界 read 不判 tandem；同一 read 多次跨 junction（`multipass_molecules`）只记录，不作拓扑证据。
+  - 位置：`whole_contig`（contig 首尾闭合，±150 bp，吸收组装器在环状 contig 两端留下的重叠；完整质粒/染色体，单独统计作技术对照）、`contig_edge`、`internal`；均标记，不删除。主结果 `support_ge3`（≥3 个独立分子），同时在 calls.json 报告 ≥1/2/3/5/10 的计数。
+  - CReSIL linkage 并行运行、结果分开保存；`scripts/cresil_trace.py` 在 CReSIL 自己的 trim.txt 上复现 linkage 的区域步骤，记录每个候选在哪一步丢失：trim（mapq≥30）→ 区域长度 ≤ -mwindow（100 kb）→ 单条 read 覆盖 ≥90% 区域 → 深度/最小长度 → 进入最终图 → 成环。模拟对照与 DRR393831：3–5 kb 质粒成环保留；~60 kb 质粒在“单 read 覆盖 90%”一步丢失；>100 kb 复制子和染色体在区域长度一步丢失；三拷贝 IS 内的环在 trim（mapq）丢失。
+  - 存档：候选表、事件表、支持 read ID、支持 read 的 PAF（含次级比对）和 BAM、CReSIL 图→read ID 表（`graph_reads.tsv.gz`，所有图的全部 read ID）、`cresil_trace.tsv`、`ont_library.json`（N50、比对率、覆盖度）和 `contig_depth.tsv`（同一培养核对：某质粒 contig 无 read 即提示非同一分离株/DNA 批次）。全库 PAF 不存档。
+  - 支持 read 序列（v3.3）：junction counter 的全部 read 都保留；CReSIL 成环图每个最多保留 `caller.cresil_graph_read_cap`（默认 50）条 read 的序列（优先 junction read，其余按 read ID 哈希固定选取；`cresil/graph_read_sequences.json` 记录每图 read 数与保留数）。1 TB 试跑中最大的归档（1–2.7 GB，超过输入）99% 是高拷贝质粒成环图的 read。ONT 不再另存 `support_reads1.fastq.gz`：`support.bam` 每条 read 恰有一条 primary（或 unmapped）记录、含完整序列和质量值，`samtools fastq -F 0x900 support.bam` 可原样恢复；删除前核对 primary 记录数等于支持 read 数。
+  - CReSIL 失败（如深文库中 worker 超内存，1 TB 试跑 1,440 例中 3 例）不再丢弃整个样本：junction counter 结果照常归档，`calls.json` 记录 `cresil.status = failed` 和错误尾部；`compare_platforms.py` 单独列出这些样本。
+  - 对照：`scripts/make_ont_controls.py`（带逐 read 真值：区分“测序证据不足”和“有证据但漏检”）+ `scripts/eval_ont_controls.py`。跨平台：`scripts/compare_platforms.py`（ONT 为主，Illumina 仅交叉支持；允许断点偏移和微同源等价）。参数在 `caller.ont_junction`（可选）。
+- Circle_finder 固定到 `3eb333db2ea6277dde36cbf640be9afeb710c717`；原始 MIT 源码和许可证在 `third_party/`。上游脚本不修改；适配层（`circlestream/rules.py`）只把 5 行 `grep -w -Ff ids table` 换成 `scripts/wordgrep.py`，按 GNU grep `-w -F`（C locale）语义逐字节等价地筛选，但避开 GNU grep 在大量互为前缀的 read ID 下的慢路径（单步曾达 2 小时）。空模式或含 tab 的模式交回 grep 本身处理。设置 `CS_WORDGREP_VERIFY=1` 会同时运行 GNU grep 并在任何差异时失败（仅用于验证）。
 - CReSIL 固定到 `78356affa6adca6a41ea297c3d7d93f5ecb5ae6a`，沿用其环境文件，安装时 `pip --no-deps`。
 - conda 求解后的完整环境清单写入 `vendor/*.explicit.txt`。安装需要网络，compute jobs 不联网安装软件。
 
@@ -81,7 +91,7 @@ LRC 初测注意：`lr_debug` 上限为 3 小时，示例现在用 2 小时。`l
 
 作业可显式加载环境：在 `slurm` 中设置 `"setup_commands": ["source /etc/profile", "module load miniforge3"]`（模块名先在本站确认）。这些是按顺序执行的 Bash 命令，失败会停止作业；配置会随 spec 冻结。默认空列表仍依赖提交时的环境。`init` 须在 `circle-control` 中执行，使保存的 Python 路径指向安装了 Snakemake 的环境。
 
-容量单位为十进制 GB。每个样本的 `peak_gb` 应包含下载、解压后的 FASTQ/FASTA、所有比对副本、排序临时文件、caller 和 evidence。Circle_finder 原版保留多份 SAM/BAM，初测不要只按压缩 FASTQ 的两倍估算。
+容量单位为十进制 GB。每个样本的 `peak_gb` 应包含下载、解压后的 FASTQ/FASTA、所有比对副本、排序临时文件、caller 和 evidence。Circle_finder 原版保留多份 SAM/BAM，初测不要只按压缩 FASTQ 的两倍估算。`scripts/sra_manifest.py` 按 SRA 对象大小估算：Illumina 30×，Nanopore 30×（1 TB 试跑 1,039 个完成样本的节点本地峰值/对象大小：中位 6.2×、p99 18×、最大 20.6×；20× 时 1,440 例中 10 例在 call 步超出，最高约 23×）。slurm 模式下 `peak_gb` 只用于单个 job 的节点本地限额，不占共享 staging 预算。
 
 `scratch_budget_gb` 是本流水线的预算，不会修改文件系统 quota。执行 rule 时每 5 秒采样一次目录大小，超过样本 reservation 会终止该进程组并保留现场；**它不是绝对的硬磁盘限额**，瞬时峰值可能漏采。archive 可用空间另行检查。共享文件系统其他用户造成的空间变化仍可能导致任务失败。
 
@@ -148,7 +158,9 @@ python stream.py submit --config production.json --watch
 
 每次提交前，提交器用 `sacct` 查已知 job ID，并用 `squeue` 确认它不再运行/排队。被杀而残留 RUNNING 的样本会进入 COMPUTE_FAILED、释放计算名额；不会删除其 worker lock，也不会自动重跑。查不到终态、查询失败、或 SUBMITTING 没有 job ID 时仍保留名额，避免重复计算。
 
-一个归档清理失败会标为 CLEANUP_FAILED，其他样本继续。DOWNLOAD_FAILED / COMPUTE_FAILED / CLEANUP_FAILED 不占 active-sample 名额，但**仍保留完整磁盘 reservation**。因此成功样本能持续循环；失败数据积压或持久 archive 满时必须处理，不能保证无人维护地无限运行。空闲轮询会打印状态统计，便于发现等待/积压。
+一个归档清理失败会标为 CLEANUP_FAILED，其他样本继续。DOWNLOAD_FAILED / COMPUTE_FAILED / CLEANUP_FAILED 不占 active-sample 名额，但**默认仍保留完整磁盘 reservation**。1 TB 试跑中 32 个失败样本占住 43 GB 原始数据，staging 预算耗尽后准入停止。大规模运行（slurm 下载模式）可设 `"release_failed_raw": true`：COMPUTE_FAILED 样本的 Slurm job 离开队列后，删除其自有 staging 目录（ownership/symlink 校验同 cleanup），状态保留 `raw_released: true` 和原错误；`recover` 将其改回 NEW，由 fetch job 重新下载（ETag/MD5 校验）后重跑。持久 archive 满时仍须处理。空闲轮询会打印状态统计；只剩 CLEANED 和需人工处理的样本时，`submit --watch` 打印汇总后退出，不再无限轮询。
+
+大规模运行建议把 `scratch_dir`（只放原始下载）放在 `/global/scratch/users/$USER`（Lustre，容量大，非备份），archive/state 留在组目录。
 
 上述恢复依赖两个控制进程继续运行。DTN/提交器进程被杀、机器重启或全局锁残留仍需恢复；不要在未确认旧进程停止时自动删除锁。
 
@@ -164,7 +176,7 @@ python stream.py cleanup --config config.local.json --sample ont_example
 归档保存：
 
 - Circle_finder 的所有 split/discordant read IDs 对应的完整原始 FASTQ（含 mates、quality）、这些模板在完整 mapping BAM 中的所有 records、split/disc 文本和 microDNA-JT。全库 concordant 文本及 read-ID 频次表不进入归档。
-- CReSIL 所有报告 graph（含 acyclic）的支持 read IDs 对应的完整原始 FASTQ；重新对全 reference 比对，保存 CIGAR/SA/secondary records；eccDNA_final、subGraphs.summary、graph 的 reference_regions.fa / final_reads.fa、仅支持 reads 的原始 trim 行（trim.support.txt）。重新比对的 BAM **不是原始 trim 内部 mappy alignment**。全库 trim 和 coverage/tmp 不进入归档。
+- ONT：junction counter 全部支持 read，以及 CReSIL 成环图（每图至多 `cresil_graph_read_cap` 条）的 read，重新对全 reference 比对为 `support.bam`（CIGAR/SA/secondary；primary 记录含完整序列与质量值，可恢复 FASTQ）；所有图的 read ID 表 `graph_reads.tsv.gz`；eccDNA_final、subGraphs.summary、graph 的 reference_regions.fa、仅支持 reads 的原始 trim 行（trim.support.txt）。重新比对的 BAM **不是原始 trim 内部 mappy alignment**。全库 trim、final_reads.fa 和 coverage/tmp 不进入归档。
 - 完整 reference FASTA/FAI、代码快照、参数、MD5、版本、日志、已完成的 rule measurements。
 - 零候选也保存有明确状态的结果。空 trim/不匹配参考/未识别软件错误不自动当作阴性。
 

@@ -107,6 +107,13 @@ def safe_id(value):
     return value
 
 
+# caller.ont_junction keys, typed exactly like the argparse flags of scripts/ont_junctions.py
+# (a 20.5 for an int flag would make every ONT call fail at argument parsing).
+ONT_JUNCTION_INTS = frozenset({"min_mapq", "min_aln", "max_qgap", "min_circle", "tolerance", "flank",
+                               "min_anchor", "edge", "dup_tolerance", "min_tandem_reads"})
+ONT_JUNCTION_FLOATS = frozenset({"repeat_score_frac", "min_expected_flank"})
+
+
 def validate_sample(sample):
     safe_id(sample["sample_id"])
     platform = sample["platform"]
@@ -158,6 +165,20 @@ def load_config(path):
         raise ValueError("CReSIL has internal minimum worker counts: allocate at least 4 CPUs")
     if c["caller"]["cresil_mode"] not in ("depth", "linkage"):
         raise ValueError("cresil_mode must be depth or linkage")
+    oj = c["caller"].get("ont_junction", {})
+    ints, floats = ONT_JUNCTION_INTS, ONT_JUNCTION_FLOATS
+    def ok(k, v):
+        return not isinstance(v, bool) and isinstance(v, int if k in ints else (int, float)) and v >= 0
+    if not isinstance(oj, dict) or set(oj) - ints - floats or any(not ok(k, v) for k, v in oj.items()):
+        raise ValueError(f"caller.ont_junction: non-negative integers for {sorted(ints)}, "
+                         f"non-negative numbers for {sorted(floats)}")
+    cap = c["caller"].get("cresil_graph_read_cap", 50)
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 0:
+        raise ValueError("caller.cresil_graph_read_cap must be a non-negative integer")
+    if not isinstance(c.get("release_failed_raw", False), bool):
+        raise ValueError("release_failed_raw must be true or false")
+    if c.get("release_failed_raw") and c.get("download_mode", "dtn") != "slurm":
+        raise ValueError("release_failed_raw needs download_mode slurm (failed samples are re-fetched by fetch jobs)")
     if c.get("download_mode", "dtn") not in ("dtn", "slurm"):
         raise ValueError("download_mode must be dtn (DTN downloader) or slurm (1-CPU fetch jobs + node-local work)")
     if c.get("reference_store"):
@@ -172,6 +193,8 @@ def load_config(path):
             raise ValueError("slurm mode needs fetch: {max_jobs, batch_gb, time, memory_gb}")
         if f["max_jobs"] <= 0 or f["batch_gb"] <= 0 or f["memory_gb"] <= 0 or f.get("max_samples", 10) <= 0:
             raise ValueError("fetch limits must be positive")
+    if c.get("sra_conversion_timeout_minutes", 60) <= 0:
+        raise ValueError("sra_conversion_timeout_minutes must be positive")
     if c["caller"].get("short_read_policy", "reject") not in ("reject", "drop_pair"):
         raise ValueError("caller.short_read_policy must be reject or drop_pair")
     return c
