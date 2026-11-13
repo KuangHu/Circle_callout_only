@@ -13,6 +13,7 @@ disabled and a time limit.
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -105,6 +106,20 @@ def fetch_refseqs(sra_path, retries):
     if left:
         raise RuntimeError(f"Refseqs still unresolved after download: {left}")
     return records
+
+
+def stage_refseqs(source, target, retries):
+    """stage-local of an SRA object: copy refseq tables kept beside the source (each must pass
+    vdb-validate), then fetch_refseqs() downloads any still missing and checks all resolve."""
+    for seqid, location in refseq_deps(target):
+        local = Path(source).parent / seqid
+        if location.startswith("remote::") and local.is_file():
+            dest = Path(target).parent / seqid
+            shutil.copy2(local, dest)
+            ok, text = validate_vdb(dest)
+            if not ok:
+                raise RuntimeError(f"Local refseq {local} failed vdb-validate: {text.strip()[:300]}")
+    return fetch_refseqs(target, retries)
 
 
 def network_isolation():

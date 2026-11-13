@@ -872,6 +872,49 @@ class PipelineTests(unittest.TestCase):
         fr.assert_called_once()
         self.assertEqual(read_json(state / "download.json")["refseqs"], [{"seqid": "BX571856.1"}])
 
+    def sra_run(self):
+        obj = self.root / "src" / "SRR000001.sra"; obj.parent.mkdir(); obj.write_bytes(b"sra-object")
+        c = dict(self.c)
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c[key] = str(self.root / ("sra_" + key))
+        write_json(self.manifest, [dict(self.s, sample_id="sra1", files=[self.sra_item(obj)])])
+        initialize(c, self.manifest)
+        return c, obj, Path(c["state_dir"]) / "sra1", Path(c["scratch_dir"]) / "sra1"
+
+    def test_stage_local_stages_sra_refseqs(self):
+        c, obj, state, scratch = self.sra_run()
+        with patch("circlestream.controller.stage_refseqs", return_value=[{"seqid": "BX571856.1"}]) as sr:
+            stage_local(c, "sra1", [obj])
+        sr.assert_called_once_with(obj, scratch / "raw" / "SRR000001.sra", c["download_retries"])
+        self.assertEqual(read_json(state / "download.json")["refseqs"], [{"seqid": "BX571856.1"}])
+        self.assertEqual(status(state), "READY")
+
+    def test_dtn_download_resume_fetches_sra_refseqs(self):
+        c, obj, state, scratch = self.sra_run()
+        (scratch / "raw").mkdir(parents=True)
+        write_json(scratch / ".owner.json", {"spec_sha256": fingerprint(read_json(state / "spec.json"))})
+        set_status(state, "DOWNLOAD_FAILED", error="network")
+        with patch("circlestream.controller.require_dtn"), patch("circlestream.controller.download_file"), \
+             patch("circlestream.controller.fetch_refseqs", return_value=[{"seqid": "BX571856.1"}]) as fr:
+            recover(c, "sra1")
+        fr.assert_called_once()
+        d = read_json(state / "download.json")
+        self.assertEqual((d["refseqs"], d["resumed"], status(state)), ([{"seqid": "BX571856.1"}], True, "READY"))
+
+    def test_stage_refseqs_copies_validated_local_tables_then_checks_resolution(self):
+        from circlestream import sra
+        src = self.root / "src"; src.mkdir(); (src / "BX571856.1").write_bytes(b"vdb")
+        raw = self.root / "raw"; raw.mkdir(); target = raw / "ERR1.sra"; target.write_bytes(b"x")
+        deps = [("BX571856.1", "remote::https://sra-download.ncbi.nlm.nih.gov/traces/refseq/BX571856.1")]
+        with patch.object(sra, "refseq_deps", return_value=deps), patch.object(sra, "validate_vdb", return_value=(True, "")), \
+             patch.object(sra, "fetch_refseqs", return_value=[{"seqid": "BX571856.1"}]) as fr:
+            self.assertEqual(sra.stage_refseqs(src / "ERR1.sra", target, 1), [{"seqid": "BX571856.1"}])
+        self.assertEqual((raw / "BX571856.1").read_bytes(), b"vdb")
+        fr.assert_called_once_with(target, 1)
+        with patch.object(sra, "refseq_deps", return_value=deps), patch.object(sra, "validate_vdb", return_value=(False, "bad")):
+            with self.assertRaisesRegex(RuntimeError, "vdb-validate"):
+                sra.stage_refseqs(src / "ERR1.sra", target, 1)
+
     def grep_binary(self):
         for cand in [Path(os.environ.get("CONDA_PREFIX", "/nonexistent")) / "bin" / "grep", shutil.which("grep")]:
             if cand and Path(cand).is_file():

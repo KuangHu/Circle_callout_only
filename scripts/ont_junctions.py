@@ -50,7 +50,11 @@ Independent support
     independent_molecules   reads grouped when the reference positions where they start and
                             stop (the molecule's cut ends) agree within --dup-tolerance bp,
                             strand ignored: duplex template/complement pairs and duplicate
-                            records count once. Thresholds use this number.
+                            records count once. Thresholds use this number. All passes of one
+                            read are one molecule, so it never exceeds junction_reads. On
+                            replicons/circles shorter than the reads, unaligned partial end
+                            passes put many chains' ends on the unit boundaries, so distinct
+                            reads can merge: a conservative lower bound there.
 
 Labels (evidence categories, never topology proof)
     tandem_supported    >= --min-tandem-reads independent molecules link the junction to

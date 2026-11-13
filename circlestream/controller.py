@@ -16,7 +16,7 @@ import time
 from .common import (GB, REPO, digest, fingerprint, is_sra, load_config, lock, read_json,
                      local_mode, safe_id, set_status, source_ok, state_paths, tree_size, validate_sample, work_root,
                      write_json, workflow_fingerprint)
-from .sra import fetch_refseqs
+from .sra import fetch_refseqs, stage_refseqs
 
 ACTIVE_JOBS = {"SUBMITTING", "QUEUED", "RUNNING"}
 HELD = {"DOWNLOAD_FAILED", "COMPUTE_FAILED", "CLEANUP_FAILED"}
@@ -177,8 +177,9 @@ def claim_scratch(state, scratch, spec):
     (scratch / "raw").mkdir(exist_ok=True)
 
 
-def fetch_inputs(c, sample, state, scratch):
-    """Download (or resume) source files into owned scratch and record timing."""
+def fetch_inputs(c, sample, state, scratch, **extra):
+    """Download (or resume) source files and SRA refseq dependencies into owned scratch and
+    record timing. Every download path (fetch job, DTN, DTN resume) goes through here."""
     start = time.time()
     refseqs = []
     for item in sample["files"]:
@@ -191,7 +192,7 @@ def fetch_inputs(c, sample, state, scratch):
         "seconds": time.time() - start,
         "compressed_bytes": sum(f["size_bytes"] for f in sample["files"]),
         "host": socket.getfqdn(), "in_job": bool(os.environ.get("SLURM_JOB_ID")),
-        "files": sample["files"]
+        "files": sample["files"], **extra
     })
 
 
@@ -522,12 +523,15 @@ def stage_local(c, sid, inputs):
         set_status(state,"DOWNLOADING")
         start=time.time()
         try:
+            refseqs = []
             for source,item in zip(inputs,sample["files"]):
                 target=scratch / "raw" / item["name"]
                 shutil.copy2(source,target)
                 if not source_ok(target, item):
                     raise ValueError("Staged input checksum mismatch")
-            write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,
+                if is_sra(item):  # aligned runs: refseqs beside the source, else fetched
+                    refseqs += stage_refseqs(source, target, c["download_retries"])
+            write_json(state/"download.json", {"seconds":time.time()-start,"local_copy":True,"refseqs":refseqs,
                 "compressed_bytes":sum(f["size_bytes"] for f in sample["files"])})
             set_status(state,"READY")
         except Exception as error:
@@ -698,12 +702,8 @@ def _recover(c, sid):
             if read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}:
                 raise ValueError("Ownership mismatch")
             set_status(state, "DOWNLOADING")
-            start = time.time()
             try:
-                for item in spec["sample"]["files"]:
-                    download_file(item, scratch / "raw", c["download_retries"])
-                write_json(state / "download.json", {"seconds": time.time()-start, "resumed": True,
-                    "compressed_bytes": sum(f["size_bytes"] for f in spec["sample"]["files"])})
+                fetch_inputs(c, spec["sample"], state, scratch, resumed=True)  # incl. SRA refseqs
                 set_status(state, "READY")
             except Exception as error:
                 set_status(state, "DOWNLOAD_FAILED", error=str(error))
