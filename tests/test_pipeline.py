@@ -1422,6 +1422,28 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(m(9850, 19850))     # 150 bp to the left: a distinct upstream interval
         self.assertFalse(m(10260, 20260))    # beyond microhomology + tolerance
 
+    def test_config_ont_junction_types_match_cli(self):
+        import argparse
+        from scripts import ont_junctions
+        for bad in ({"min_mapq": 20.5}, {"min_tandem_reads": True}, {"repeat_score_frac": False}, {"edge": -1}):
+            p = self.root / "cfg.json"; write_json(p, dict(self.c, caller=dict(self.c["caller"], ont_junction=bad)))
+            with self.assertRaisesRegex(ValueError, "ont_junction"):
+                load_config(p)
+        good = {"min_mapq": 30, "repeat_score_frac": 0.8, "min_expected_flank": 2}
+        p = self.root / "cfg.json"; write_json(p, dict(self.c, caller=dict(self.c["caller"], ont_junction=good)))
+        load_config(p)
+        # the accepted keys are exactly the counter's tunable flags, with the same types
+        from circlestream.common import ONT_JUNCTION_INTS, ONT_JUNCTION_FLOATS
+        seen = {}
+        def capture(parser, *a, **k):
+            seen["p"] = parser; raise SystemExit
+        with patch.object(argparse.ArgumentParser, "parse_args", autospec=True, side_effect=capture):
+            with self.assertRaises(SystemExit):
+                ont_junctions.main()
+        typed = {a.dest: a.type for a in seen["p"]._actions if a.option_strings and a.dest not in ("help", "events", "support_ids")}
+        self.assertEqual({d for d, t in typed.items() if t is int}, set(ONT_JUNCTION_INTS))
+        self.assertEqual({d for d, t in typed.items() if t is float}, set(ONT_JUNCTION_FLOATS))
+
     def test_config_rejects_unknown_ont_junction_key(self):
         c = dict(self.c, caller=dict(self.c["caller"], ont_junction={"min_reads": 3, "bogus": 1}))
         p = self.root / "cfg.json"; write_json(p, c)

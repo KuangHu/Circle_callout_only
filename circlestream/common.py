@@ -107,6 +107,13 @@ def safe_id(value):
     return value
 
 
+# caller.ont_junction keys, typed exactly like the argparse flags of scripts/ont_junctions.py
+# (a 20.5 for an int flag would make every ONT call fail at argument parsing).
+ONT_JUNCTION_INTS = frozenset({"min_mapq", "min_aln", "max_qgap", "min_circle", "tolerance", "flank",
+                               "min_anchor", "edge", "dup_tolerance", "min_tandem_reads"})
+ONT_JUNCTION_FLOATS = frozenset({"repeat_score_frac", "min_expected_flank"})
+
+
 def validate_sample(sample):
     safe_id(sample["sample_id"])
     platform = sample["platform"]
@@ -159,10 +166,12 @@ def load_config(path):
     if c["caller"]["cresil_mode"] not in ("depth", "linkage"):
         raise ValueError("cresil_mode must be depth or linkage")
     oj = c["caller"].get("ont_junction", {})
-    allowed = {"min_mapq", "min_aln", "max_qgap", "min_circle", "tolerance", "flank",
-               "min_anchor", "edge", "dup_tolerance", "repeat_score_frac", "min_tandem_reads", "min_expected_flank"}
-    if not isinstance(oj, dict) or set(oj) - allowed or any(not isinstance(v, (int, float)) or v < 0 for v in oj.values()):
-        raise ValueError(f"caller.ont_junction must map {sorted(allowed)} to non-negative numbers")
+    ints, floats = ONT_JUNCTION_INTS, ONT_JUNCTION_FLOATS
+    def ok(k, v):
+        return not isinstance(v, bool) and isinstance(v, int if k in ints else (int, float)) and v >= 0
+    if not isinstance(oj, dict) or set(oj) - ints - floats or any(not ok(k, v) for k, v in oj.items()):
+        raise ValueError(f"caller.ont_junction: non-negative integers for {sorted(ints)}, "
+                         f"non-negative numbers for {sorted(floats)}")
     cap = c["caller"].get("cresil_graph_read_cap", 50)
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 0:
         raise ValueError("caller.cresil_graph_read_cap must be a non-negative integer")
