@@ -91,6 +91,14 @@ def check_snapshot(c):
         raise ValueError("Configuration differs from init snapshot; create a separate benchmark run")
 
 
+def dependency_bytes(state):
+    """Bytes of refseq dependencies a fetch job staged for this sample (0 until recorded)."""
+    d = state / "download.json"
+    if not d.is_file():
+        return 0
+    return sum(r.get("size_bytes") or 0 for r in read_json(d).get("refseqs", []))
+
+
 def raw_released(state):
     return bool(read_json(state / "status.json").get("raw_released"))
 
@@ -104,6 +112,9 @@ def admitted(c, sample):
     if local_mode(c):
         # Shared scratch only holds source objects; node-local disk holds the work.
         raw = sum(f["size_bytes"] for p in active for f in read_json(p / "spec.json")["sample"]["files"])
+        # Aligned SRA runs also stage refseq dependencies beside the object; their sizes are only
+        # known once fetched (download.json), so charge them from then on.
+        raw += sum(dependency_bytes(p) for p in active)
         need = sum(f["size_bytes"] for f in sample["files"])
         if len(live) >= c["max_active_samples"] or (raw + need) / GB > c["scratch_budget_gb"]:
             return False
@@ -390,39 +401,53 @@ def release_failed_raw(c):
     """Opt-in (release_failed_raw, slurm mode). Held samples keep their raw objects on shared
     staging, and those bytes count against scratch_budget_gb: in the 1 TB run, 32 failures held
     43 GB and admission stalled. Once a COMPUTE_FAILED sample's job has left the queue, delete
-    its owned staging directory; `recover` then re-fetches (checksum-gated) instead of resuming."""
+    its owned staging directory; `recover` then re-fetches (checksum-gated) instead of resuming.
+
+    Returns the number of failed samples whose release is deferred (worker still finishing, job
+    still queued, or a concurrent recover holding the sample's .release-lock), so the watcher
+    keeps running until they can be released."""
     if not (local_mode(c) and c.get("release_failed_raw")):
-        return
+        return 0
     failed = [p for p in entries(c) if status(p) == "COMPUTE_FAILED" and not raw_released(p)]
     if not failed:
-        return
+        return 0
     try:
         queue = subprocess.run(["squeue", "--noheader", "--user", getpass.getuser(), "--format=%A"],
                                check=True, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"Queue unavailable; not releasing failed raw: {error}", file=sys.stderr, flush=True)
-        return
+        return len(failed)
     live = set(queue.stdout.split())
     root = Path(c["scratch_dir"]).resolve()
+    deferred = 0
     for state in failed:
-        if any((state / name).exists() for name in (".worker-lock", ".cleanup-lock")):
-            continue
-        job = state / "job.json"
-        if job.exists() and read_json(job)["job_id"] in live:
-            continue  # the worker may still be finishing on its node
-        scratch = Path(c["scratch_dir"]) / state.name
-        if scratch.exists():
-            spec = read_json(state / "spec.json")
-            if (scratch.is_symlink() or scratch.resolve().parent != root
-                    or read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}
-                    or any(p.is_symlink() for p in scratch.rglob("*"))):
-                print(f"Not releasing {state.name}: scratch ownership/symlink check failed", file=sys.stderr, flush=True)
-                continue
-            shutil.rmtree(scratch)
-        info = read_json(state / "status.json")
-        info.pop("updated", None)
-        set_status(state, info.pop("status"), raw_released=True, **info)
-        print(f"Released raw staging of failed {state.name}; recover re-fetches it", flush=True)
+        try:
+            # recover() takes the same per-sample lock, so the status cannot change between
+            # these checks and the deletion (no READY + new worker on a deleted directory).
+            with lock(state / ".release-lock"):
+                if status(state) != "COMPUTE_FAILED" or raw_released(state):
+                    continue
+                job = state / "job.json"
+                if (any((state / name).exists() for name in (".worker-lock", ".cleanup-lock"))
+                        or (job.exists() and read_json(job)["job_id"] in live)):
+                    deferred += 1  # the worker may still be finishing on its node
+                    continue
+                scratch = Path(c["scratch_dir"]) / state.name
+                if scratch.exists():
+                    spec = read_json(state / "spec.json")
+                    if (scratch.is_symlink() or scratch.resolve().parent != root
+                            or read_json(scratch / ".owner.json") != {"spec_sha256": fingerprint(spec)}
+                            or any(p.is_symlink() for p in scratch.rglob("*"))):
+                        print(f"Not releasing {state.name}: scratch ownership/symlink check failed", file=sys.stderr, flush=True)
+                        continue
+                    shutil.rmtree(scratch)
+                info = read_json(state / "status.json")
+                info.pop("updated", None)
+                set_status(state, info.pop("status"), raw_released=True, **info)
+                print(f"Released raw staging of failed {state.name}; recover re-fetches it", flush=True)
+        except RuntimeError:
+            deferred += 1  # .release-lock held by a concurrent recover
+    return deferred
 
 
 def cleanup_archived(c):
@@ -645,6 +670,16 @@ def cleanup(c, sid):
 
 def recover(c, sid):
     """Explicit operator action, not automatic retry of ambiguous Slurm submissions."""
+    state, _ = state_paths(c, sid)
+    if status(state) == "COMPUTE_FAILED":
+        # Serialize with release_failed_raw: it must not delete staging that this recovery is
+        # about to hand to a new worker, and recovery must see whether raw was released.
+        with lock(state / ".release-lock"):
+            return _recover(c, sid)
+    return _recover(c, sid)
+
+
+def _recover(c, sid):
     state, scratch = state_paths(c, sid)
     current = status(state)
     for name in (".worker-lock", ".cleanup-lock"):
@@ -750,11 +785,12 @@ def main():
         {"cleanup":cleanup,"recover":recover,"verify":reconcile_archive}[a.command](c, a.sample)
         return
     while True:
+        deferred = 0
         try:
             if a.command == "submit" and c["auto_cleanup"]:
                 cleanup_archived(c)
             if a.command == "submit":
-                release_failed_raw(c)
+                deferred = release_failed_raw(c)
             if a.command == "download":
                 progressed = download_one(c, a.sample)
             else:
@@ -769,7 +805,7 @@ def main():
             break
         if all(status(p) == "CLEANED" for p in entries(c)):
             break
-        if a.command == "submit" and only_held_left(c):
+        if a.command == "submit" and only_held_left(c) and not deferred:
             held = sum(status(p) in HELD for p in entries(c))
             print(f"Nothing left to run: {held} held sample(s) need review/recover; exiting watch", flush=True)
             break

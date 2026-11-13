@@ -579,6 +579,47 @@ class PipelineTests(unittest.TestCase):
         recover(c, "t0")
         self.assertEqual((status(state), read_json(state / "status.json")["raw_refetch"]), ("NEW", True))
 
+    def test_slurm_mode_admission_charges_staged_refseq_dependencies(self):
+        c = self.slurm_mode(2)
+        t0 = Path(c["state_dir"]) / "t0"
+        set_status(t0, "READY")
+        size = self.raw.stat().st_size
+        c["scratch_budget_gb"] = 2.5 * size / GB      # room for t0 + t1 source objects
+        t1 = read_json(Path(c["state_dir"]) / "t1" / "spec.json")["sample"]
+        self.assertTrue(admitted(c, t1))
+        write_json(t0 / "download.json", {"refseqs": [{"seqid": "NC_000913.3", "size_bytes": size}, {"seqid": "x", "size_bytes": None}]})
+        self.assertFalse(admitted(c, t1))             # the staged refseq now counts against the budget
+
+    def test_release_failed_raw_defers_for_live_worker_and_concurrent_recover(self):
+        c = self.slurm_mode(1); c["release_failed_raw"] = True
+        state = Path(c["state_dir"]) / "t0"
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            submit_fetch(c)
+            with patch.dict("os.environ", {"SLURM_JOB_ID": "555"}):
+                fetch_specs([state / "spec.json"])
+        scratch = Path(c["scratch_dir"]) / "t0"
+        write_json(state / "job.json", {"job_id": "777"})
+        set_status(state, "COMPUTE_FAILED", error="x")
+        empty_queue = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", "")  # noqa: E731
+        (state / ".worker-lock").mkdir()                     # worker wrote COMPUTE_FAILED, still cleaning up
+        with patch("circlestream.controller.subprocess.run", side_effect=empty_queue):
+            self.assertEqual(release_failed_raw(c), 1)
+        self.assertTrue(scratch.exists())
+        self.assertTrue(only_held_left(c))                   # the watch must not exit: deferred
+        (state / ".worker-lock").rmdir()
+        (state / ".release-lock").mkdir()                    # a concurrent recover holds the sample
+        with patch("circlestream.controller.subprocess.run", side_effect=empty_queue):
+            self.assertEqual(release_failed_raw(c), 1)
+        self.assertTrue(scratch.exists())
+        with self.assertRaisesRegex(RuntimeError, "Lock exists"):
+            recover(c, "t0")                                  # and recover waits for a running release
+        (state / ".release-lock").rmdir()
+        with patch("circlestream.controller.subprocess.run", side_effect=empty_queue):
+            self.assertEqual(release_failed_raw(c), 0)
+        self.assertFalse(scratch.exists())
+        self.assertFalse((state / ".release-lock").exists())
+
     def test_release_failed_raw_is_opt_in(self):
         c = self.slurm_mode(1)
         state, scratch = Path(c["state_dir"]) / "t0", Path(c["scratch_dir"]) / "t0"
@@ -1000,6 +1041,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(r["label"], "junction_supported")           # one flank read: not tandem_supported
         self.assertEqual(r["circle_compatible"], "no")                 # ...but it does exclude "compatible"
         self.assertGreaterEqual(int(r["multipass_molecules"]), 1)     # recorded, not used for topology
+
+    def test_ont_junction_multipass_read_is_one_molecule_and_never_tandem_alone(self):
+        # One read: L-flank [9000,12000) | unit [10000,12000) | unit + R-flank [10000,13000).
+        # Two back-jump events at the same junction, each reaching outside sequence, but ONE molecule.
+        reads = self.long_background() + [("mp", 8000, [(0, 3000, "+", "chr1", 9000, 12000), (3000, 5000, "+", "chr1", 10000, 12000),
+                                                        (5000, 8000, "+", "chr1", 10000, 13000)])]
+        rows, events, _ = self.junctions(reads)
+        r = rows[0]
+        self.assertEqual(sum(e["read"] == "mp" for e in events), 2)   # both events recorded
+        self.assertEqual((r["junction_reads"], r["independent_molecules"], r["tandem_flank_molecules"]), ("1", "1", "1"))
+        self.assertNotEqual(r["label"], "tandem_supported")
+        self.assertEqual((r["multipass_molecules"], r["support_ge3"]), ("1", "no"))
 
     def test_ont_junction_repeat_or_short_anchors_are_ambiguous(self):
         reads = self.long_background()

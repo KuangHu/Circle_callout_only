@@ -216,13 +216,23 @@ def microhomology(seq, start, end, limit=200):
 
 
 def molecules(members, tol):
+    """Group events into physical molecules. All events of one read are ONE molecule first (a
+    read crossing the junction twice yields two events with different coordinates, but is a
+    single observation); reads are then merged when their reference start/stop agree within
+    tol (duplex strands, duplicate records)."""
+    by_read = collections.defaultdict(list)
+    for e in members:
+        by_read[e["read"]].append(e)
+    reads = sorted((((min(e["molecule_start"] for e in evs), max(e["molecule_end"] for e in evs)), name, evs)
+                    for name, evs in by_read.items()), key=lambda t: (t[0], t[1]))
+    reads = [(key, evs) for key, _, evs in reads]
     groups = []
-    for e in sorted(members, key=lambda e: (e["molecule_start"], e["molecule_end"])):
+    for key, evs in reads:
         for g in groups:
-            if abs(g[0][0] - e["molecule_start"]) <= tol and abs(g[0][1] - e["molecule_end"]) <= tol:
-                g[1].append(e); break
+            if abs(g[0][0] - key[0]) <= tol and abs(g[0][1] - key[1]) <= tol:
+                g[1].extend(evs); break
         else:
-            groups.append(((e["molecule_start"], e["molecule_end"]), [e]))
+            groups.append((key, list(evs)))
     return [g[1] for g in groups]
 
 
