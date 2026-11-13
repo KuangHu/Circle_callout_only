@@ -97,7 +97,10 @@ def fetch_refseqs(sra_path, retries):
         if location.startswith("remote::") and location != "remote::" + url:
             raise ValueError(f"Refseq {seqid} resolves to an unexpected location: {location}")
         # Stage every dependency beside the object: one resolved from a host-local sra-tools
-        # cache on this node would look remote on a compute node without that cache.
+        # cache on this node would look remote on a compute node without that cache. A table
+        # already there (earlier attempt, stage-local copy) is accepted only if it validates.
+        if dest.is_file() and not validate_vdb(dest)[0]:
+            dest.unlink()
         fetched = not dest.exists()
         if fetched:
             _curl(url, dest, retries)
@@ -119,6 +122,7 @@ def stage_refseqs(source, target, retries):
             shutil.copy2(local, dest)
             ok, text = validate_vdb(dest)
             if not ok:
+                dest.unlink()  # never leave a corrupt table that a retry could resolve
                 raise RuntimeError(f"Local refseq {local} failed vdb-validate: {text.strip()[:300]}")
     return fetch_refseqs(target, retries)
 

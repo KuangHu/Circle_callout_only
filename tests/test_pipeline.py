@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -956,6 +957,32 @@ class PipelineTests(unittest.TestCase):
         with patch.object(sra, "refseq_deps", return_value=deps), patch.object(sra, "validate_vdb", return_value=(False, "bad")):
             with self.assertRaisesRegex(RuntimeError, "vdb-validate"):
                 sra.stage_refseqs(src / "ERR1.sra", target, 1)
+        self.assertFalse((raw / "BX571856.1").exists())  # failed copy removed, so a retry cannot accept it
+
+    def test_fetch_refseqs_replaces_an_existing_table_that_fails_validation(self):
+        from circlestream import sra
+        raw = self.root / "raw"; raw.mkdir(); obj = raw / "ERR1.sra"; obj.write_bytes(b"x")
+        (raw / "BX571856.1").write_bytes(b"corrupt")
+        outputs = iter([f"BX571856.1,a,false,local::{raw}/BX571856.1\n"] * 2)
+        def fake_run(cmd, **kw):
+            if cmd[0].endswith("align-info"):
+                return subprocess.CompletedProcess(cmd, 0, next(outputs), "")
+            if cmd[0] == "curl":
+                Path(cmd[cmd.index("--output") + 1]).write_bytes(b"refseq")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            good = Path(cmd[-1]).read_bytes() == b"refseq"  # vdb-validate
+            return subprocess.CompletedProcess(cmd, 0 if good else 3, "Table is consistent" if good else "corrupt", "")
+        with patch("circlestream.sra.sra_tool", side_effect=lambda n: n), patch("circlestream.sra.subprocess.run", side_effect=fake_run):
+            recs = sra.fetch_refseqs(obj, 1)
+        self.assertEqual((raw / "BX571856.1").read_bytes(), b"refseq")
+        self.assertIsNotNone(recs[0]["url"])
+
+    def test_ont_control_manifest_is_initializable(self):
+        from scripts.make_ont_controls import manifest_entry
+        fq_path = self.root / "reads1.fastq.gz"; fq(fq_path)
+        sample = manifest_entry("circle", fq_path, self.ref)
+        validate_sample(sample)
+        self.assertEqual(sample["files"][0]["path"], str(fq_path))
 
     def grep_binary(self):
         for cand in [Path(os.environ.get("CONDA_PREFIX", "/nonexistent")) / "bin" / "grep", shutil.which("grep")]:

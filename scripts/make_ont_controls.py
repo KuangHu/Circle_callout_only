@@ -31,6 +31,14 @@ from pathlib import Path
 ANCHOR, FLANK = 300, 100
 
 
+def manifest_entry(sid, fq, reference):
+    """url: placeholder required by `init` (never fetched); path: the input for `stage-local`."""
+    return {"sample_id": f"ontctl_{sid}", "accession": "synthetic-ont-control", "platform": "nanopore",
+            "library": "wgs", "reference": str(reference), "peak_gb": 4,
+            "files": [{"name": fq.name, "url": f"https://example.invalid/ont-controls/{sid}/{fq.name}",
+                       "path": str(fq), "size_bytes": fq.stat().st_size, "md5": hashlib.md5(fq.read_bytes()).hexdigest()}]}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True); ap.add_argument("--seed", type=int, default=20261108)
@@ -117,10 +125,7 @@ def main():
         fq = folder / "reads1.fastq.gz"
         with fq.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as h:
             h.write("".join(records).encode())
-        manifest.append({"sample_id": f"ontctl_{sid}", "accession": "synthetic-ont-control", "platform": "nanopore",
-                         "library": "wgs", "reference": str(out / "reference.fa"), "peak_gb": 4,
-                         "files": [{"name": fq.name, "path": str(fq), "size_bytes": fq.stat().st_size,
-                                    "md5": hashlib.md5(fq.read_bytes()).hexdigest()}]})
+        manifest.append(manifest_entry(sid, fq, out / "reference.fa"))
         truth["samples"][sid] = {j: {"evidence_reads": len(v), "reads_reaching_outside": sum(o for _, o in v),
                                      "read_ids": sorted(r for r, _ in v)} for j, v in sorted(spans.items())}
     (out / "samples.json").write_text(json.dumps(manifest, indent=2))
