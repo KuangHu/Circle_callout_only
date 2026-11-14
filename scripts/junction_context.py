@@ -61,7 +61,7 @@ ID_COLS = ["junction_id", "contig", "start", "end", "length", "contig_length", "
            "circle_compatible", "support_ge3", "independent_molecules", "junction_reads", "microhomology_bp"]
 COLS = (["sample"] + ID_COLS + ["upstream_bp", "downstream_bp", "boundary_repeat", "upstream", "downstream",
         "circle_junction", "genome_copies", "copy_loci", "called_locus_in_copies", "in_fasta"])
-COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+COMP = str.maketrans("ACGTRYKMSWBDHVNacgtrykmswbdhvn", "TGCAYRMKSWVHDBNtgcayrmkswvhdbn")  # full IUPAC
 
 
 def revcomp(s):

@@ -1519,6 +1519,8 @@ class PipelineTests(unittest.TestCase):
                             minimap2=mm if os.path.exists(mm) else "")
         out, fasta = sample_context("S1", rows, ref, o)
         self.assertEqual(set().union(*out) - set(COLS), set())
+        self.assertEqual(revcomp("ACGTRYKMSWBDHVN"), "NBDHVWSKMRYACGT")   # every IUPAC code complemented
+        self.assertEqual(revcomp("rykm"), "kmry")
         r = out[0]
         self.assertEqual((r["upstream"], r["downstream"]), (up[-200:], down[:200]))
         self.assertEqual(r["boundary_repeat"], "GA")
