@@ -1502,7 +1502,8 @@ class PipelineTests(unittest.TestCase):
         down = "GA" + ("C" if body[0] != "C" else "T") + down[3:]       # repeat is exactly "GA"
         chr1 = up + "GA" + body + down                                   # unit [1000, 1300) = "GA" + body
         unit = chr1[1000:1300]
-        chr2 = rs(700) + revcomp(unit) + rs(700)                         # second copy, minus strand
+        tail = unit[280:].translate(str.maketrans("ACGT", "TGCA"))       # last 20 bp diverged: alignment covers 93%
+        chr2 = rs(700) + revcomp(unit[:280] + tail) + rs(700)            # second copy, minus strand
         chr3 = rs(5000)
         chr5 = rs(500) + rs(100) * 6 + rs(500)                           # tandem array: unit also aligns shifted
         ref = self.root / "ctx.fa"; ref.write_text(f">chr1\n{chr1}\n>chr2\n{chr2}\n>chr3\n{chr3}\n>chr5\n{chr5}\n")
@@ -1531,7 +1532,8 @@ class PipelineTests(unittest.TestCase):
         if o.minimap2:
             self.assertEqual((r["genome_copies"], r["called_locus_in_copies"]), (2, "yes"))
             self.assertIn("chr2:700-1000:-", r["copy_loci"])
-            self.assertEqual(seq("S1|J1|copy2").upper()[200:500], unit)   # copy shown in the called orientation
+            copy = "".join(ch for ch in seq("S1|J1|copy2") if ch.isupper())  # shown in the called orientation,
+            self.assertEqual(copy, unit[:280] + tail)                            # full unit despite the partial alignment
             self.assertEqual((out[3]["genome_copies"], out[3]["called_locus_in_copies"]), (1, "yes"))  # short unit finds itself
             self.assertEqual((out[4]["genome_copies"], out[4]["called_locus_in_copies"]), (1, "yes"))  # tandem array: one locus, its own
 

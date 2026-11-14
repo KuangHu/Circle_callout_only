@@ -36,7 +36,9 @@ Columns (besides the ont_junctions identity/support columns)
                          shorter than --min-copy-len or longer than --max-circle).
                          Overlapping hits are one locus (the hit at the called locus wins), so a
                          unit that also aligns shifted inside its own tandem array counts once.
-  copy_loci              contig:start-end:strand of every copy (capped at --max-loci).
+  copy_loci              contig:start-end:strand of every copy (capped at --max-loci). Copy
+                         boundaries are the alignment extended by the circle's unaligned ends
+                         (strand-aware, clipped at contig ends), so every copy spans the full unit.
   called_locus_in_copies sanity check: "yes" when the search found the called locus itself.
 whole_contig rows (replicon closures, a technical control) get no flanks or sequence.
 """
@@ -109,7 +111,11 @@ def genome_copies(queries, reference, minimap2, min_cov=0.9, min_ident=0.9):
         f = line.split("\t")
         qlen, qs, qe, matches, alen = int(f[1]), int(f[2]), int(f[3]), int(f[9]), int(f[10])
         if (qe - qs) >= min_cov * qlen and alen and matches / alen >= min_ident:
-            hits[f[0]].append((f[5], int(f[7]), int(f[8]), f[4]))
+            # The alignment may stop short of the circle's ends (>= min_cov is enough): project the
+            # unaligned query ends onto the target (strand-aware) so the copy spans the whole unit.
+            tlen, ts, te, strand = int(f[6]), int(f[7]), int(f[8]), f[4]
+            left, right = (qs, qlen - qe) if strand == "+" else (qlen - qe, qs)
+            hits[f[0]].append((f[5], max(0, ts - left), min(tlen, te + right), strand))
     return hits
 
 
