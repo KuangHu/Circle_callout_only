@@ -36,6 +36,8 @@ Columns (besides the ont_junctions identity/support columns)
                          shorter than --min-copy-len or longer than --max-circle).
                          Overlapping hits are one locus (the hit at the called locus wins), so a
                          unit that also aligns shifted inside its own tandem array counts once.
+  copies_capped          "yes" when minimap2 reported its maximum number of alignments for the
+                         circle (MAX_SECONDARY + 1): genome_copies is then a lower bound.
   copy_loci              contig:start-end:strand of every copy (capped at --max-loci). Copy
                          boundaries are the alignment extended by the circle's unaligned ends
                          (strand-aware, clipped at contig ends), so every copy spans the full unit.
@@ -43,6 +45,7 @@ Columns (besides the ont_junctions identity/support columns)
 whole_contig rows (replicon closures, a technical control) get no flanks or sequence.
 """
 import argparse
+import collections
 import contextlib
 import csv
 import gzip
@@ -60,7 +63,7 @@ from pathlib import Path
 ID_COLS = ["junction_id", "contig", "start", "end", "length", "contig_length", "location", "label",
            "circle_compatible", "support_ge3", "independent_molecules", "junction_reads", "microhomology_bp"]
 COLS = (["sample"] + ID_COLS + ["upstream_bp", "downstream_bp", "boundary_repeat", "upstream", "downstream",
-        "circle_junction", "genome_copies", "copy_loci", "called_locus_in_copies", "in_fasta"])
+        "circle_junction", "genome_copies", "copies_capped", "copy_loci", "called_locus_in_copies", "in_fasta"])
 COMP = str.maketrans("ACGTRYKMSWBDHVNacgtrykmswbdhvn", "TGCAYRMKSWVHDBNtgcayrmkswvhdbn")  # full IUPAC
 
 
@@ -97,18 +100,23 @@ def layout(seq, start, end, flank):
     return seq[max(0, start - flank):start], seq[start:end], seq[end:end + flank]
 
 
+MAX_SECONDARY = 500  # minimap2 -N: alignments reported per query are at most MAX_SECONDARY + 1
+
+
 def genome_copies(queries, reference, minimap2, min_cov=0.9, min_ident=0.9):
-    """{query: [(contig, start, end, strand)]} near-identical copies of each query in reference."""
+    """({query: [(contig, start, end, strand)]}, {queries whose alignments hit the -N cap}):
+    near-identical copies of each query in reference."""
     if not queries:
-        return {}
+        return {}, set()
     with tempfile.TemporaryDirectory() as tmp:
         fa = Path(tmp) / "q.fa"
         fa.write_text("".join(f">{k}\n{v}\n" for k, v in queries.items()))
-        out = subprocess.run([minimap2, "-c", "-x", "asm20", "-s", "50", "--secondary=yes", "-N", "500", "-p", "0.1", "-t", "1",
+        out = subprocess.run([minimap2, "-c", "-x", "asm20", "-s", "50", "--secondary=yes", "-N", str(MAX_SECONDARY), "-p", "0.1", "-t", "1",
                               str(reference), str(fa)], check=True, capture_output=True, text=True).stdout
-    hits = {k: [] for k in queries}
+    hits, reported = {k: [] for k in queries}, collections.Counter()
     for line in out.splitlines():
         f = line.split("\t")
+        reported[f[0]] += 1
         qlen, qs, qe, matches, alen = int(f[1]), int(f[2]), int(f[3]), int(f[9]), int(f[10])
         if (qe - qs) >= min_cov * qlen and alen and matches / alen >= min_ident:
             # The alignment may stop short of the circle's ends (>= min_cov is enough): project the
@@ -116,7 +124,7 @@ def genome_copies(queries, reference, minimap2, min_cov=0.9, min_ident=0.9):
             tlen, ts, te, strand = int(f[6]), int(f[7]), int(f[8]), f[4]
             left, right = (qs, qlen - qe) if strand == "+" else (qlen - qe, qs)
             hits[f[0]].append((f[5], max(0, ts - left), min(tlen, te + right), strand))
-    return hits
+    return hits, {k for k, n in reported.items() if n > MAX_SECONDARY}
 
 
 def same_locus(c, s, e, contig, start, end):
@@ -148,7 +156,7 @@ def sample_context(sample, rows, reference, o):
         start, end = int(r["start"]), int(r["end"])
         if r["location"] != "whole_contig" and o.min_copy_len <= end - start <= o.max_circle:
             queries[r["junction_id"]] = seqs[r["contig"]][start:end]
-    copies = genome_copies(queries, reference, o.minimap2) if o.minimap2 else {}
+    copies, capped = genome_copies(queries, reference, o.minimap2) if o.minimap2 else ({}, set())
     for r in rows:
         row = {"sample": sample, **{k: r.get(k, "") for k in ID_COLS}}
         seq, start, end = seqs[r["contig"]], int(r["start"]), int(r["end"])
@@ -160,7 +168,7 @@ def sample_context(sample, rows, reference, o):
                    upstream=up, downstream=down, circle_junction=circle[len(circle) - j:] + circle[:j])
         loci = collapse(copies[r["junction_id"]], r["contig"], start, end) if r["junction_id"] in copies else None
         if loci is not None:
-            row.update(genome_copies=len(loci),
+            row.update(genome_copies=len(loci), copies_capped="yes" if r["junction_id"] in capped else "no",
                        copy_loci=";".join(f"{c}:{s}-{e}:{st}" for c, s, e, st in loci[:o.max_loci]),
                        called_locus_in_copies="yes" if any(same_locus(c, s, e, r["contig"], start, end)
                                                            for c, s, e, _ in loci) else "no")

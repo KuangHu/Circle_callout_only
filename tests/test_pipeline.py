@@ -1322,6 +1322,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((j["status"], j["returncode"], j["error_tail"][-1]), ("failed", 1, "KeyError: 'chrX'"))
         self.assertFalse(any((x.out / n).exists() for n in JUNCTION_CONTEXT))  # no stale context archived
 
+    def test_junction_context_flags_copy_counts_at_the_minimap2_cap(self):
+        from scripts.junction_context import MAX_SECONDARY, sample_context
+        ref = self.root / "rep.fa"; ref.write_text(">chr1\n" + "ACGT" * 2000 + "\n")
+        fake = self.root / "mm2"  # reports MAX_SECONDARY + 1 full-length alignments, the most minimap2 returns
+        fake.write_text("#!/bin/sh\nfor i in $(seq 0 %d); do printf '1\\t200\\t0\\t200\\t+\\tchr1\\t8000\\t%%d\\t%%d\\t200\\t200\\t60\\n' "
+                        "$((i*10)) $((i*10+200)); done\n" % MAX_SECONDARY); fake.chmod(0o755)
+        row = {"junction_id": "1", "contig": "chr1", "start": "0", "end": "200", "length": "200", "contig_length": "8000",
+               "location": "internal", "label": "ambiguous", "support_ge3": "no", "independent_molecules": "1"}
+        o = SimpleNamespace(flank=100, junction_bp=50, max_circle=200000, min_copy_len=100, max_loci=5, minimap2=str(fake))
+        out, _ = sample_context("S1", [row], ref, o)
+        self.assertEqual(out[0]["copies_capped"], "yes")   # a lower bound, not an exact count
+        o.minimap2 = ""
+        self.assertNotIn("copies_capped", sample_context("S1", [row], ref, o)[0][0])
+
     def test_junction_context_batch_mode_reads_any_archive_name(self):
         import io, tarfile
         def archive(path, members):
