@@ -141,6 +141,10 @@ def validate_sample(sample):
             raise ValueError("Source MD5 and positive compressed file size are required")
     if sample["peak_gb"] * GB <= sum(f["size_bytes"] for f in files):
         raise ValueError("peak_gb must reserve raw + unpacked + mapping + caller + evidence workspace")
+    meta = sample.get("metadata", {})
+    if not isinstance(meta, dict) or not all(isinstance(k, str) and isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                                             for k, v in meta.items()):
+        raise ValueError("metadata must map column names to plain values (str/int/float)")
     ref = Path(sample["reference"])
     if not ref.is_absolute() or not ref.is_file() or ref.suffix == ".gz":
         raise ValueError(f"Reference must be an existing, uncompressed FASTA: {ref}")

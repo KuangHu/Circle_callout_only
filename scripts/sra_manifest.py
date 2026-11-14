@@ -4,6 +4,8 @@
 Input TSV columns (header required): sample_id, accession, platform, reference
 Optional column: peak_gb. Without it, peak_gb is estimated from the SRA object size
 using factors measured on LRC (batch1 peaks plus the uncompressed fasterq-dump output).
+Any other non-empty column (e.g. Scientific_Name, ont_model, library_construction_protocol)
+is carried into the entry as "metadata" and so archived with the sample (metadata/spec.json).
 
     python scripts/sra_manifest.py runs.tsv > samples.batchN.json
 
@@ -24,6 +26,7 @@ BUCKET = "https://sra-pub-run-odp.s3.amazonaws.com/sra"
 # 6.2x, p99 18x, max 20.6x; 10 of 1,440 failed at 20x (up to ~23x, in the call step).
 PEAK_FACTOR = {"illumina": 30, "nanopore": 30}
 PEAK_MIN_GB = 2
+COLUMNS = {"sample_id", "accession", "platform", "reference", "peak_gb"}
 
 
 def head(url, retries=4):
@@ -61,9 +64,13 @@ def main():
                 missing.append(f"{acc}\t{error}")
                 continue
             peak = float(row["peak_gb"]) if row.get("peak_gb") else max(PEAK_MIN_GB, math.ceil(size / 1e9 * PEAK_FACTOR[platform] + 1))
-            out.append({"sample_id": row["sample_id"].strip(), "accession": acc, "platform": platform,
-                        "library": "wgs", "reference": row["reference"].strip(), "peak_gb": peak,
-                        "files": [{"name": f"{acc}.sra", "url": url, "size_bytes": size, "s3_etag": etag}]})
+            entry = {"sample_id": row["sample_id"].strip(), "accession": acc, "platform": platform,
+                     "library": "wgs", "reference": row["reference"].strip(), "peak_gb": peak,
+                     "files": [{"name": f"{acc}.sra", "url": url, "size_bytes": size, "s3_etag": etag}]}
+            meta = {k: v.strip() for k, v in row.items() if k and k not in COLUMNS and v and v.strip()}
+            if meta:
+                entry["metadata"] = meta
+            out.append(entry)
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
     for line in missing:
