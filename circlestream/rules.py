@@ -409,6 +409,7 @@ def ont_junctions(x):
     paf.unlink()  # whole-library alignment: never archived, regenerated from the raw run if needed
     with (x.out / "ont_junctions.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
+    context = junction_context(x)
     by = collections.Counter(f"{r['location']}/{r['label']}" for r in rows)
     thresholds = {f">={t}": collections.Counter(f"{r['location']}/{r['label']}" for r in rows
                                                 if int(r["independent_molecules"]) >= t) for t in (1, 2, 3, 5, 10)}
@@ -416,7 +417,33 @@ def ont_junctions(x):
             "by_min_independent_molecules": {k: dict(sorted(v.items())) for k, v in thresholds.items()},
             "primary_threshold": "independent_molecules >= 3",
             "circle_compatible_yes": sum(r["circle_compatible"] == "yes" for r in rows),
+            "junction_context": context,
             "note": "evidence categories, not topology proof; whole_contig = replicon closures (technical control)"}
+
+
+CONTEXT_FLANK = 1000
+JUNCTION_CONTEXT = ("junction_context.tsv.gz", "junction_context.fa.gz", "junction_context.ge3.fa.gz")
+
+
+def junction_context(x):
+    """[upstream][circle][downstream] of every junction from the sample's own assembly
+    (scripts/junction_context.py, CONTEXT_FLANK bp flanks, genome copies of the circle sequence).
+    It only reads ont_junctions.tsv and the reference. A failure is recorded, never fatal: the
+    archive keeps ont_junctions.tsv and the reference SHA-256, so the context can be regenerated."""
+    try:
+        x.run([sys.executable, REPO / "scripts" / "junction_context.py", "--junctions", x.out / "ont_junctions.tsv",
+               "--reference", x.ref, "--sample", x.s["sample_id"], "--out", x.out / "junction_context",
+               "--flank", CONTEXT_FLANK])
+    except subprocess.CalledProcessError as error:
+        for name in JUNCTION_CONTEXT:
+            (x.out / name).unlink(missing_ok=True)
+        return {"status": "failed", "returncode": error.returncode,
+                "error_tail": stderr_tail(x, os.environ.get("CS_RULE", "call"))}
+    with gzip.open(x.out / JUNCTION_CONTEXT[0], "rt") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    return {"status": "ok", "files": list(JUNCTION_CONTEXT), "flank_bp": CONTEXT_FLANK, "junctions": len(rows),
+            "multi_copy": sum(r["genome_copies"] not in ("", "0", "1") for r in rows),
+            "called_locus_not_found": sum(r["called_locus_in_copies"] == "no" for r in rows)}
 
 
 def copy_caller_evidence(out, ev, platform, wanted):
@@ -438,7 +465,8 @@ def copy_caller_evidence(out, ev, platform, wanted):
             keep = rel.as_posix() in {
                 "eccDNA_final.txt", "no_candidates.json", "cresil_run/subGraphs.summary.txt",
                 "ont_junctions.tsv", "ont_junction_events.tsv", "ont_junction_ids.txt",
-                "ont_junctions.support.paf.gz", "cresil_trace.tsv", "ont_library.json", "contig_depth.tsv"}
+                "ont_junctions.support.paf.gz", "cresil_trace.tsv", "ont_library.json", "contig_depth.tsv",
+                *JUNCTION_CONTEXT}
             # final_reads.fa holds read sequence for EVERY graph (whole replicons in deep samples:
             # gigabytes); keep graph -> read ID tables instead (graph_reads.tsv.gz, below).
             keep = keep or (len(rel.parts) == 4 and rel.parts[:2] == ("cresil_run", "assemGraph")

@@ -410,7 +410,8 @@ class PipelineTests(unittest.TestCase):
         ev = self.root / "evidence"; ev.mkdir()
         keep = ["eccDNA_final.txt", "cresil_run/subGraphs.summary.txt", "cresil_run/assemGraph/ecc1/reference_regions.fa",
                 "ont_junctions.tsv", "ont_junction_events.tsv", "ont_junction_ids.txt", "ont_junctions.support.paf.gz",
-                "cresil_trace.tsv", "ont_library.json", "contig_depth.tsv"]
+                "cresil_trace.tsv", "ont_library.json", "contig_depth.tsv",
+                "junction_context.tsv.gz", "junction_context.fa.gz", "junction_context.ge3.fa.gz"]
         # final_reads.fa: read sequence for every graph (whole replicons in deep samples); IDs are kept elsewhere.
         omit = ["cresil_run/tmp/merge_genomecov.txt", "cresil_run/tmp/ref_aln.regions.bed.gz",
                 "cresil_run/tmp/ref_aln.bam", "unrecognized.txt", "cresil_run/assemGraph/ecc1/final_reads.fa", "junctions.paf"]
@@ -1294,6 +1295,83 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ovl_5end", j["cresil"]["error_tail"][-1])
         self.assertFalse((x.out / "eccDNA_final.txt").exists())
 
+    def test_junction_context_step_writes_context_and_never_fails_the_sample(self):
+        from circlestream.rules import JUNCTION_CONTEXT, junction_context
+        x = self.ont_rule_context(); x.s["sample_id"] = "S1_ont"
+        (x.out / "ont_junctions.tsv").write_text(
+            "junction_id\tcontig\tstart\tend\tlength\tcontig_length\tlocation\tlabel\tcircle_compatible\tsupport_ge3\t"
+            "independent_molecules\tjunction_reads\tmicrohomology_bp\n1\tchr1\t100\t300\t200\t400\tinternal\tjunction_supported\tna\tno\t1\t1\t0\n")
+        mm = shutil.which("minimap2") or "/global/home/groups/pc_rubinlab/databases/kuang/system/.cache/conda/envs/cresil/bin/minimap2"
+        if not os.path.exists(mm):  # CI: stand-in that finds no copies (the pipeline's tool env has minimap2)
+            mm = self.root / "bin" / "minimap2"; mm.parent.mkdir(); mm.write_text("#!/bin/sh\nexit 0\n"); mm.chmod(0o755)
+        env = dict(os.environ, PATH=str(Path(mm).parent) + os.pathsep + os.environ["PATH"])
+        x.run = lambda args, **kw: subprocess.run(list(map(str, args)), check=True, env=env, capture_output=True)  # noqa: E731
+        j = junction_context(x)
+        self.assertEqual((j["status"], j["junctions"], j["flank_bp"], j["files"]), ("ok", 1, 1000, list(JUNCTION_CONTEXT)))
+        with gzip.open(x.out / "junction_context.tsv.gz", "rt") as h:
+            row = dict(zip(*[l.rstrip("\n").split("\t") for l in h]))
+        ref = "ACGT" * 100
+        self.assertEqual((row["sample"], row["upstream"], row["downstream"]), ("S1_ont", ref[:100], ref[300:]))
+        self.assertTrue(all((x.out / n).is_file() for n in JUNCTION_CONTEXT))
+        def fail(args, **kw):
+            (x.log / "call.9.9.stderr.log").write_text("Traceback\nKeyError: 'chrX'\n")
+            raise subprocess.CalledProcessError(1, args)
+        x.run = fail
+        with patch.dict(os.environ, {"CS_RULE": "call"}):
+            j = junction_context(x)  # must not raise
+        self.assertEqual((j["status"], j["returncode"], j["error_tail"][-1]), ("failed", 1, "KeyError: 'chrX'"))
+        self.assertFalse(any((x.out / n).exists() for n in JUNCTION_CONTEXT))  # no stale context archived
+
+    def test_junction_context_flags_copy_counts_at_the_minimap2_cap(self):
+        from scripts.junction_context import MAX_SECONDARY, sample_context
+        ref = self.root / "rep.fa"; ref.write_text(">chr1\n" + "ACGT" * 2000 + "\n")
+        fake = self.root / "mm2"  # reports MAX_SECONDARY + 1 full-length alignments, the most minimap2 returns
+        fake.write_text("#!/bin/sh\nfor i in $(seq 0 %d); do printf '1\\t200\\t0\\t200\\t+\\tchr1\\t8000\\t%%d\\t%%d\\t200\\t200\\t60\\n' "
+                        "$((i*10)) $((i*10+200)); done\n" % MAX_SECONDARY); fake.chmod(0o755)
+        row = {"junction_id": "1", "contig": "chr1", "start": "0", "end": "200", "length": "200", "contig_length": "8000",
+               "location": "internal", "label": "ambiguous", "support_ge3": "no", "independent_molecules": "1"}
+        o = SimpleNamespace(flank=100, junction_bp=50, max_circle=200000, min_copy_len=100, max_loci=5, minimap2=str(fake))
+        out, _ = sample_context("S1", [row], ref, o)
+        self.assertEqual(out[0]["copies_capped"], "yes")   # a lower bound, not an exact count
+        o.minimap2 = ""
+        self.assertNotIn("copies_capped", sample_context("S1", [row], ref, o)[0][0])
+
+    def test_junction_context_batch_mode_reads_any_archive_name(self):
+        import io, tarfile
+        def archive(path, members):
+            with tarfile.open(path, "w:gz") as t:
+                for name, text in members.items():
+                    data = text.encode(); info = tarfile.TarInfo(name); info.size = len(data); t.addfile(info, io.BytesIO(data))
+        d = self.root / "archives"; d.mkdir()
+        tsv = ("junction_id\tcontig\tstart\tend\tlength\tcontig_length\tlocation\tlabel\tcircle_compatible\tsupport_ge3\t"
+               "independent_molecules\tjunction_reads\tmicrohomology_bp\n1\tchr1\t100\t300\t200\t400\tinternal\tjunction_supported\tna\tyes\t3\t3\t0\n")
+        spec = lambda platform: json.dumps({"sample": {"platform": platform}})  # noqa: E731
+        ref = json.dumps({"path": str(self.ref), "sha256": digest(self.ref)})
+        archive(d / "isolate7.tar.gz", {"evidence/reference.json": ref, "evidence/cresil/ont_junctions.tsv": tsv, "metadata/spec.json": spec("nanopore")})
+        archive(d / "isolate8.partial.tar.gz", {"evidence/reference.json": ref, "evidence/cresil/ont_junctions.tsv": tsv, "metadata/spec.json": spec("nanopore")})
+        archive(d / "isolate9.tar.gz", {"evidence/reference.json": ref, "metadata/spec.json": spec("illumina")})
+        r = subprocess.run([sys.executable, str(REPO / "scripts" / "junction_context.py"), "--archives", str(d),
+                            "--out", str(self.root / "ctx"), "--minimap2", ""], capture_output=True, text=True, check=True)
+        self.assertIn("1 ONT samples (0 skipped; 1 Illumina archives ignored)", r.stdout)
+        with gzip.open(self.root / "ctx.tsv.gz", "rt") as h:
+            self.assertEqual([l.split("\t")[0] for l in h][1:], ["isolate7"])
+
+    def test_sra_manifest_carries_extra_columns_as_metadata(self):
+        import contextlib, io
+        from scripts import sra_manifest
+        runs = self.root / "runs.tsv"
+        runs.write_text("sample_id\taccession\tplatform\treference\tScientific_Name\tont_model\tlibrary_name\n"
+                        f"S1_ont\tSRR0000001\tnanopore\t{self.ref}\tEscherichia coli\tGridION\t\n")
+        out = io.StringIO()
+        with patch.object(sra_manifest, "head", return_value=(10 ** 9, "0" * 32)), \
+             patch.object(sys, "argv", ["sra_manifest.py", str(runs)]), contextlib.redirect_stdout(out):
+            sra_manifest.main()
+        entry = json.loads(out.getvalue())[0]
+        self.assertEqual(entry["metadata"], {"Scientific_Name": "Escherichia coli", "ont_model": "GridION"})  # empty dropped
+        validate_sample(entry)
+        with self.assertRaisesRegex(ValueError, "metadata"):
+            validate_sample(dict(entry, metadata={"x": [1]}))
+
     def test_ont_trim_failure_still_runs_junction_scan(self):
         from circlestream.rules import mapping, call
         x = self.ont_rule_context()
@@ -1449,6 +1527,51 @@ class PipelineTests(unittest.TestCase):
         p = self.root / "cfg.json"; write_json(p, c)
         with self.assertRaisesRegex(ValueError, "ont_junction"):
             load_config(p)
+
+    def test_junction_context_layout_boundary_repeat_and_copies(self):
+        import random
+        from scripts.junction_context import COLS, revcomp, sample_context
+        rnd = random.Random(1); rs = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))  # noqa: E731
+        up, body, down = rs(1000), rs(298), rs(1000)
+        down = "GA" + ("C" if body[0] != "C" else "T") + down[3:]       # repeat is exactly "GA"
+        chr1 = up + "GA" + body + down                                   # unit [1000, 1300) = "GA" + body
+        unit = chr1[1000:1300]
+        tail = unit[280:].translate(str.maketrans("ACGT", "TGCA"))       # last 20 bp diverged: alignment covers 93%
+        chr2 = rs(700) + revcomp(unit[:280] + tail) + rs(700)            # second copy, minus strand
+        chr3 = rs(5000)
+        chr5 = rs(500) + rs(100) * 6 + rs(500)                           # tandem array: unit also aligns shifted
+        ref = self.root / "ctx.fa"; ref.write_text(f">chr1\n{chr1}\n>chr2\n{chr2}\n>chr3\n{chr3}\n>chr5\n{chr5}\n")
+        base = {"label": "junction_supported", "circle_compatible": "na", "support_ge3": "yes",
+                "independent_molecules": "3", "junction_reads": "3", "microhomology_bp": "2"}
+        rows = [dict(base, junction_id="1", contig="chr1", start="1000", end="1300", length="300", contig_length=str(len(chr1)), location="internal"),
+                dict(base, junction_id="2", contig="chr1", start="100", end="400", length="300", contig_length=str(len(chr1)), location="contig_edge"),
+                dict(base, junction_id="3", contig="chr3", start="0", end="5000", length="5000", contig_length="5000", location="whole_contig"),
+                dict(base, junction_id="4", contig="chr3", start="2000", end="2150", length="150", contig_length="5000", location="internal"),
+                dict(base, junction_id="5", contig="chr5", start="750", end="1050", length="300", contig_length="1600", location="internal", support_ge3="no")]
+        mm = shutil.which("minimap2") or "/global/home/groups/pc_rubinlab/databases/kuang/system/.cache/conda/envs/cresil/bin/minimap2"
+        o = SimpleNamespace(flank=200, junction_bp=50, max_circle=200000, min_copy_len=100, max_loci=50,
+                            minimap2=mm if os.path.exists(mm) else "")
+        out, fasta = sample_context("S1", rows, ref, o)
+        self.assertEqual(set().union(*out) - set(COLS), set())
+        self.assertEqual(revcomp("ACGTRYKMSWBDHVN"), "NBDHVWSKMRYACGT")   # every IUPAC code complemented
+        self.assertEqual(revcomp("rykm"), "kmry")
+        r = out[0]
+        self.assertEqual((r["upstream"], r["downstream"]), (up[-200:], down[:200]))
+        self.assertEqual(r["boundary_repeat"], "GA")
+        self.assertEqual(r["circle_junction"], unit[-50:] + unit[:50])
+        self.assertEqual(out[1]["upstream_bp"], 100)                     # truncated at the contig start, no wrapping
+        self.assertEqual(out[2]["in_fasta"], "no (whole_contig)"); self.assertNotIn("upstream", out[2])
+        self.assertEqual({ge3 for ge3, rec in fasta if rec.startswith(">S1|J5")}, {False})  # left out of the ge3 FASTA
+        recs = dict(rec[1:].split("\n", 1) for _, rec in fasta)
+        seq = lambda h: next(v for k, v in recs.items() if k.startswith(h)).replace("\n", "")  # noqa: E731
+        self.assertEqual(seq("S1|J1 "), up[-200:].lower() + unit + down[:200].lower())
+        if o.minimap2:
+            self.assertEqual((r["genome_copies"], r["called_locus_in_copies"]), (2, "yes"))
+            self.assertIn("chr2:700-1000:-", r["copy_loci"])
+            copy = "".join(ch for ch in seq("S1|J1|copy2") if ch.isupper())  # shown in the called orientation,
+            self.assertEqual(copy, unit[:280] + tail)                            # full unit despite the partial alignment
+            self.assertEqual((out[3]["genome_copies"], out[3]["called_locus_in_copies"]), (1, "yes"))  # short unit finds itself
+            self.assertEqual((out[4]["genome_copies"], out[4]["called_locus_in_copies"]), (1, "yes"))  # tandem array: one locus, its own
 
 
 if __name__=="__main__": unittest.main()
