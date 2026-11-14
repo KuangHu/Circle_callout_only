@@ -24,7 +24,9 @@ import urllib.request
 BUCKET = "https://sra-pub-run-odp.s3.amazonaws.com/sra"
 # Nanopore: node-local peak / SRA object size over 1,039 completed 1 TB-run samples was median
 # 6.2x, p99 18x, max 20.6x; 10 of 1,440 failed at 20x (up to ~23x, in the call step).
-PEAK_FACTOR = {"illumina": 30, "nanopore": 30}
+# ont1tb3 at 30x (1,447 samples): completed median 6.5x, p99 22.9x, max 28.8x; 5 exceeded it at
+# 31-32x (call step). 40x: peak_gb is node-local /tmp (1.8 TB per lr7 node), not shared scratch.
+PEAK_FACTOR = {"illumina": 30, "nanopore": 40}
 PEAK_MIN_GB = 2
 COLUMNS = {"sample_id", "accession", "platform", "reference", "peak_gb"}
 
