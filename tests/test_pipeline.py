@@ -1302,6 +1302,8 @@ class PipelineTests(unittest.TestCase):
             "junction_id\tcontig\tstart\tend\tlength\tcontig_length\tlocation\tlabel\tcircle_compatible\tsupport_ge3\t"
             "independent_molecules\tjunction_reads\tmicrohomology_bp\n1\tchr1\t100\t300\t200\t400\tinternal\tjunction_supported\tna\tno\t1\t1\t0\n")
         mm = shutil.which("minimap2") or "/global/home/groups/pc_rubinlab/databases/kuang/system/.cache/conda/envs/cresil/bin/minimap2"
+        if not os.path.exists(mm):  # CI: stand-in that finds no copies (the pipeline's tool env has minimap2)
+            mm = self.root / "bin" / "minimap2"; mm.parent.mkdir(); mm.write_text("#!/bin/sh\nexit 0\n"); mm.chmod(0o755)
         env = dict(os.environ, PATH=str(Path(mm).parent) + os.pathsep + os.environ["PATH"])
         x.run = lambda args, **kw: subprocess.run(list(map(str, args)), check=True, env=env, capture_output=True)  # noqa: E731
         j = junction_context(x)
