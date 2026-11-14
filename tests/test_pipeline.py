@@ -1322,6 +1322,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((j["status"], j["returncode"], j["error_tail"][-1]), ("failed", 1, "KeyError: 'chrX'"))
         self.assertFalse(any((x.out / n).exists() for n in JUNCTION_CONTEXT))  # no stale context archived
 
+    def test_junction_context_batch_mode_reads_any_archive_name(self):
+        import io, tarfile
+        def archive(path, members):
+            with tarfile.open(path, "w:gz") as t:
+                for name, text in members.items():
+                    data = text.encode(); info = tarfile.TarInfo(name); info.size = len(data); t.addfile(info, io.BytesIO(data))
+        d = self.root / "archives"; d.mkdir()
+        tsv = ("junction_id\tcontig\tstart\tend\tlength\tcontig_length\tlocation\tlabel\tcircle_compatible\tsupport_ge3\t"
+               "independent_molecules\tjunction_reads\tmicrohomology_bp\n1\tchr1\t100\t300\t200\t400\tinternal\tjunction_supported\tna\tyes\t3\t3\t0\n")
+        spec = lambda platform: json.dumps({"sample": {"platform": platform}})  # noqa: E731
+        ref = json.dumps({"path": str(self.ref), "sha256": digest(self.ref)})
+        archive(d / "isolate7.tar.gz", {"evidence/reference.json": ref, "evidence/cresil/ont_junctions.tsv": tsv, "metadata/spec.json": spec("nanopore")})
+        archive(d / "isolate8.partial.tar.gz", {"evidence/reference.json": ref, "evidence/cresil/ont_junctions.tsv": tsv, "metadata/spec.json": spec("nanopore")})
+        archive(d / "isolate9.tar.gz", {"evidence/reference.json": ref, "metadata/spec.json": spec("illumina")})
+        r = subprocess.run([sys.executable, str(REPO / "scripts" / "junction_context.py"), "--archives", str(d),
+                            "--out", str(self.root / "ctx"), "--minimap2", ""], capture_output=True, text=True, check=True)
+        self.assertIn("1 ONT samples (0 skipped; 1 Illumina archives ignored)", r.stdout)
+        with gzip.open(self.root / "ctx.tsv.gz", "rt") as h:
+            self.assertEqual([l.split("\t")[0] for l in h][1:], ["isolate7"])
+
     def test_sra_manifest_carries_extra_columns_as_metadata(self):
         import contextlib, io
         from scripts import sra_manifest

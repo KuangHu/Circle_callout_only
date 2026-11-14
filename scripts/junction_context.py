@@ -198,13 +198,16 @@ def sha256(path):
 def from_archive(args):
     path, o = args
     sample = Path(path).name[:-len(".tar.gz")]
-    want = {"evidence/reference.json": None, "evidence/cresil/ont_junctions.tsv": None}
+    want = {"evidence/reference.json": None, "evidence/cresil/ont_junctions.tsv": None, "metadata/spec.json": None}
     with tarfile.open(path, "r:gz") as tar:
         for m in tar:
             if m.name in want:
                 want[m.name] = tar.extractfile(m).read().decode()
                 if all(v is not None for v in want.values()):
                     break
+    platform = json.loads(want["metadata/spec.json"])["sample"]["platform"] if want["metadata/spec.json"] else None
+    if platform == "illumina":
+        return sample, [], [], None  # not an ONT archive: no junction scan to put in context
     if want["evidence/cresil/ont_junctions.tsv"] is None:
         return sample, [], [], "no ont_junctions.tsv"
     ref = json.loads(want["evidence/reference.json"])
@@ -218,7 +221,7 @@ def from_archive(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--archives", nargs="+", help="directories of <SAMPLE>.tar.gz archives (nanopore)")
+    ap.add_argument("--archives", nargs="+", help="directories of <SAMPLE>.tar.gz archives (Illumina ones are ignored)")
     ap.add_argument("--junctions"); ap.add_argument("--reference"); ap.add_argument("--sample")
     ap.add_argument("--out", required=True, help="output prefix")
     ap.add_argument("--flank", type=int, default=1000)
@@ -231,7 +234,7 @@ def main():
     o = ap.parse_args()
     if bool(o.archives) == bool(o.junctions):
         ap.error("give --archives or --junctions/--reference/--sample")
-    samples = problems = n = 0
+    samples = problems = n = illumina = 0
     with gzip.open(o.out + ".tsv.gz", "wt", newline="", compresslevel=6) as t, \
             gzip.open(o.out + ".fa.gz", "wt", compresslevel=6) as f, gzip.open(o.out + ".ge3.fa.gz", "wt", compresslevel=6) as f3, \
             (multiprocessing.Pool(o.threads) if o.archives else contextlib.nullcontext()) as pool:
@@ -241,9 +244,12 @@ def main():
             rows = list(csv.DictReader(open(o.junctions), delimiter="\t"))
             results = iter([(o.sample, *sample_context(o.sample, rows, o.reference, o), "")])
         else:
-            paths = sorted(str(p) for d in o.archives for p in Path(d).glob("*_ont.tar.gz"))
+            # every completed archive (any sample ID); the platform comes from the archive's spec
+            paths = sorted(str(p) for d in o.archives for p in Path(d).glob("*.tar.gz") if not p.name.endswith(".partial.tar.gz"))
             results = pool.imap(from_archive, [(p, o) for p in paths], chunksize=2)
         for sample, rows, fa, problem in results:  # streamed: archives in sorted order
+            if problem is None:
+                illumina += 1; continue
             samples += 1; n += len(rows)
             if problem:
                 problems += 1
@@ -253,7 +259,8 @@ def main():
                 f.write(rec)
                 if ge3:
                     f3.write(rec)
-    print(f"{samples} samples ({problems} skipped), {n} junctions -> {o.out}.tsv.gz, {o.out}.fa.gz, {o.out}.ge3.fa.gz")
+    print(f"{samples} ONT samples ({problems} skipped; {illumina} Illumina archives ignored), {n} junctions -> "
+          f"{o.out}.tsv.gz, {o.out}.fa.gz, {o.out}.ge3.fa.gz")
 
 
 if __name__ == "__main__":
