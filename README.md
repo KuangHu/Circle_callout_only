@@ -160,6 +160,8 @@ python stream.py submit --config production.json --watch
 
 每次提交前，提交器用 `sacct` 查已知 job ID，并用 `squeue` 确认它不再运行/排队。被杀而残留 RUNNING 的样本会进入 COMPUTE_FAILED、释放计算名额；不会删除其 worker lock，也不会自动重跑。查不到终态、查询失败、或 SUBMITTING 没有 job ID 时仍保留名额，避免重复计算。
 
+`submit --watch` 每轮先对账一次，然后一次填满所有空闲名额：计算作业补到 `max_jobs`，slurm 模式的 fetch 作业补到 `fetch.max_jobs`（每个 fetch 作业仍单独做准入检查）。v3.4 及以前每轮只提交一个计算作业和一个 fetch 作业；B1（6,313 个样本、40 个计算名额）中控制器每轮要扫描数千个状态文件，每分钟只能提交 3–4 个作业，而小样本作业约 8 分钟就结束，所以常常只有 15–35 个作业同时运行。某个 sbatch 失败或结果不确定时立即停止本轮：该样本留在 SUBMITTING 等待人工检查，后面的样本保持 READY，下一轮再提交。
+
 一个归档清理失败会标为 CLEANUP_FAILED，其他样本继续。DOWNLOAD_FAILED / COMPUTE_FAILED / CLEANUP_FAILED 不占 active-sample 名额，但**默认仍保留完整磁盘 reservation**。1 TB 试跑中 32 个失败样本占住 43 GB 原始数据，staging 预算耗尽后准入停止。大规模运行（slurm 下载模式）可设 `"release_failed_raw": true`：COMPUTE_FAILED 样本的 Slurm job 离开队列后，删除其自有 staging 目录（ownership/symlink 校验同 cleanup），状态保留 `raw_released: true` 和原错误；`recover` 将其改回 NEW，由 fetch job 重新下载（ETag/MD5 校验）后重跑。持久 archive 满时仍须处理。空闲轮询会打印状态统计；只剩 CLEANED 和需人工处理的样本时，`submit --watch` 打印汇总后退出，不再无限轮询。
 
 大规模运行建议把 `scratch_dir`（只放原始下载）放在 `/global/scratch/users/$USER`（Lustre，容量大，非备份），archive/state 留在组目录。

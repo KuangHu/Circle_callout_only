@@ -261,61 +261,71 @@ def reconcile_fetch(c):
 
 
 def submit_fetch(c):
-    """Launch one 1-CPU fetch job for a group of admitted NEW samples (slurm mode)."""
+    """Launch 1-CPU fetch jobs for groups of admitted NEW samples (slurm mode), filling every free
+    fetch slot in one pass. Returns the number of fetch jobs submitted."""
     validate_slurm(c)
-    f, s = c["fetch"], c["slurm"]
     with lock(Path(c["state_dir"]) / ".submit-lock"):
         reconcile_fetch(c)
-        free_slots = f["max_jobs"] - len(fetch_records(c))
-        if free_slots <= 0:
-            return False
-        # Spread admissible samples over all free fetch slots (each fetch job downloads
-        # serially), so several fetch jobs feed processing concurrently.
-        states = entries(c)
-        live = sum(1 for p in states if status(p) not in ("NEW", "CLEANED") and status(p) not in HELD)
-        share = -(-max(0, c["max_active_samples"] - live) // free_slots)
-        cap = max(1, min(f.get("max_samples", 10), share))
-        chosen, size = [], 0
-        for state in states:
-            if status(state) != "NEW":
-                continue
-            spec = read_json(state / "spec.json")
-            need = sum(x["size_bytes"] for x in spec["sample"]["files"])
-            if len(chosen) >= cap or (chosen and size + need > f["batch_gb"] * GB):
-                break
-            if not admitted(c, spec["sample"]):
-                break
-            claim_scratch(state, state_paths(c, state.name)[1], spec)
-            set_status(state, "DOWNLOADING", fetch_job="pending")
-            chosen.append(state)
-            size += need
-        if not chosen:
-            return False
-        d = Path(c["state_dir"]) / ".fetch"
-        d.mkdir(exist_ok=True)
+        free_slots = c["fetch"]["max_jobs"] - len(fetch_records(c))
+        submitted = 0
+        while free_slots > 0 and _submit_fetch_job(c, free_slots):
+            submitted += 1
+            free_slots -= 1
+        return submitted
+
+
+def _submit_fetch_job(c, free_slots):
+    """One fetch job; caller holds the submit lock. False when no NEW sample is admissible."""
+    f, s = c["fetch"], c["slurm"]
+    # Spread admissible samples over all free fetch slots (each fetch job downloads
+    # serially), so several fetch jobs feed processing concurrently.
+    states = entries(c)
+    live = sum(1 for p in states if status(p) not in ("NEW", "CLEANED") and status(p) not in HELD)
+    share = -(-max(0, c["max_active_samples"] - live) // free_slots)
+    cap = max(1, min(f.get("max_samples", 10), share))
+    chosen, size = [], 0
+    for state in states:
+        if status(state) != "NEW":
+            continue
+        spec = read_json(state / "spec.json")
+        need = sum(x["size_bytes"] for x in spec["sample"]["files"])
+        if len(chosen) >= cap or (chosen and size + need > f["batch_gb"] * GB):
+            break
+        if not admitted(c, spec["sample"]):
+            break
+        claim_scratch(state, state_paths(c, state.name)[1], spec)
+        set_status(state, "DOWNLOADING", fetch_job="pending")
+        chosen.append(state)
+        size += need
+    if not chosen:
+        return False
+    d = Path(c["state_dir"]) / ".fetch"
+    d.mkdir(exist_ok=True)
+    tag = f"fetch-{time.time_ns()}"
+    while (d / f"{tag}.sh").exists():  # several jobs per pass: never reuse a record name
         tag = f"fetch-{time.time_ns()}"
-        python = read_json(chosen[0] / "spec.json")["python"]
-        cmd = [python, str(REPO / "stream.py"), "fetch"] + [x for st in chosen for x in ("--spec", str(st / "spec.json"))]
-        script = d / f"{tag}.sh"
-        script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(s.get("setup_commands", [])) +
-                          "\nexec " + shlex.join(cmd) + "\n", encoding="utf-8", newline="\n")
-        result = subprocess.run([
-            "sbatch", "--parsable", "--account", s["account"], "--partition", s["partition"], "--qos", s["qos"],
-            "--cpus-per-task", "1", "--mem", f"{f['memory_gb']}G", "--time", f["time"],
-            "--job-name", "csf_" + fingerprint(tag)[:12], "--output", str(d / f"{tag}-%j.out"), str(script)
-        ], text=True, capture_output=True)
-        jobid = result.stdout.strip().split(";")[0]
-        if result.returncode != 0 or not jobid.isdigit():
-            for st in chosen:
-                set_status(st, "DOWNLOAD_FAILED", error=f"Fetch submission failed: {result.stderr.strip()[:300]}")
-            raise RuntimeError(f"Fetch job submission failed: {result.stderr.strip()}")
-        write_json(d / f"{tag}.json", {"job_id": jobid, "samples": [st.name for st in chosen],
-                                       "bytes": size, "submitted": time.time()})
+    python = read_json(chosen[0] / "spec.json")["python"]
+    cmd = [python, str(REPO / "stream.py"), "fetch"] + [x for st in chosen for x in ("--spec", str(st / "spec.json"))]
+    script = d / f"{tag}.sh"
+    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(s.get("setup_commands", [])) +
+                      "\nexec " + shlex.join(cmd) + "\n", encoding="utf-8", newline="\n")
+    result = subprocess.run([
+        "sbatch", "--parsable", "--account", s["account"], "--partition", s["partition"], "--qos", s["qos"],
+        "--cpus-per-task", "1", "--mem", f"{f['memory_gb']}G", "--time", f["time"],
+        "--job-name", "csf_" + fingerprint(tag)[:12], "--output", str(d / f"{tag}-%j.out"), str(script)
+    ], text=True, capture_output=True)
+    jobid = result.stdout.strip().split(";")[0]
+    if result.returncode != 0 or not jobid.isdigit():
         for st in chosen:
-            if status(st) == "DOWNLOADING":
-                set_status(st, "DOWNLOADING", fetch_job=jobid)
-        print(f"Fetch job {jobid}: {len(chosen)} samples, {size/1e9:.2f} GB", flush=True)
-        return True
+            set_status(st, "DOWNLOAD_FAILED", error=f"Fetch submission failed: {result.stderr.strip()[:300]}")
+        raise RuntimeError(f"Fetch job submission failed: {result.stderr.strip()}")
+    write_json(d / f"{tag}.json", {"job_id": jobid, "samples": [st.name for st in chosen],
+                                   "bytes": size, "submitted": time.time()})
+    for st in chosen:
+        if status(st) == "DOWNLOADING":
+            set_status(st, "DOWNLOADING", fetch_job=jobid)
+    print(f"Fetch job {jobid}: {len(chosen)} samples, {size/1e9:.2f} GB", flush=True)
+    return True
 
 
 def fetch_specs(spec_paths):
@@ -466,13 +476,25 @@ def cleanup_archived(c):
 
 
 def submit_one(c, through="archive", sid=None):
+    return submit_ready(c, through, sid, limit=1) > 0
+
+
+def submit_ready(c, through="archive", sid=None, limit=None):
+    """Submit READY samples until every free job slot (max_jobs) is used, or `limit` jobs, in one
+    pass under the submit lock (one scheduler reconciliation, one state scan). Returns the number
+    submitted. A failed or uncertain sbatch raises at once: that sample stays SUBMITTING for review
+    and the samples after it are left READY for the next pass."""
     validate_slurm(c)
+    submitted = 0
     with lock(Path(c["state_dir"]) / ".submit-lock"):
         reconcile_jobs(c)
-        active = [p for p in entries(c) if status(p) in ACTIVE_JOBS]
-        if len(active) >= c["max_jobs"]:
-            return False
-        for state in entries(c):
+        states = entries(c)
+        free = c["max_jobs"] - sum(1 for p in states if status(p) in ACTIVE_JOBS)
+        if limit is not None:
+            free = min(free, limit)
+        for state in states:
+            if submitted >= free:
+                break
             if sid and state.name != sid:
                 continue
             if status(state) != "READY":
@@ -500,8 +522,8 @@ def submit_one(c, through="archive", sid=None):
             write_json(state / "job.json", {"job_id": jobid, "job_name": name, "submitted": time.time(), "through": through})
             # Worker may already have started or completed. Do not overwrite its status.
             print(f"Submitted {state.name}: {jobid}", flush=True)
-            return True
-    return False
+            submitted += 1
+    return submitted
 
 
 def stage_local(c, sid, inputs):
@@ -794,8 +816,8 @@ def main():
             if a.command == "download":
                 progressed = download_one(c, a.sample)
             else:
-                fetched = submit_fetch(c) if local_mode(c) else False
-                progressed = submit_one(c, a.through, a.sample) or fetched
+                fetched = submit_fetch(c) if local_mode(c) else 0
+                progressed = submit_ready(c, a.through, a.sample) > 0 or fetched > 0
         except Exception as error:
             if not a.watch:
                 raise
