@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from circlestream.common import GB, REPO, S3_PART_SIZES, digest, s3_etag_matches, source_ok, fingerprint, load_config, lock, read_json, set_status, validate_sample, write_json
-from circlestream.controller import admitted, release_failed_raw, only_held_left, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, verify_bundle, validate_slurm, worker, submit_fetch, fetch_specs, reconcile_fetch, fetch_records
+from circlestream.controller import admitted, release_failed_raw, only_held_left, cleanup, cleanup_archived, download_file, download_one, initialize, reconcile_archive, reconcile_jobs, recover, stage_local, status, submit_one, submit_ready, verify_bundle, validate_slurm, worker, submit_fetch, fetch_specs, reconcile_fetch, fetch_records
 from circlestream.fastq import extract, materialize
 from circlestream.rules import Context, archive, cf_lines, convert_sra, copy_caller_evidence, library_depth
 from scripts.cresil_wgls_checked import execute, strict_call
@@ -727,8 +727,8 @@ class PipelineTests(unittest.TestCase):
         records = []
         with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
              patch("circlestream.controller.reconcile_fetch"):
-            while submit_fetch(c):
-                pass
+            self.assertEqual(submit_fetch(c), 3)   # one pass fills every free fetch slot
+            self.assertEqual(submit_fetch(c), 0)
         sizes = [len(read_json(r)["samples"]) for r in fetch_records(c)]
         self.assertEqual(sizes, [2, 2, 2])  # 6 admissible over 3 free slots, not 6 in one job
         c2 = self.slurm_mode(5)
@@ -740,6 +740,67 @@ class PipelineTests(unittest.TestCase):
              patch("circlestream.controller.reconcile_fetch"):
             submit_fetch(c2)
         self.assertEqual(len(read_json(fetch_records(c2)[0])["samples"]), 3)
+
+    def test_submit_fetch_fills_free_slots_until_admission_stops(self):
+        c = self.slurm_mode(6)
+        c.update(max_active_samples=6, fetch=dict(c["fetch"], max_jobs=4, max_samples=1, batch_gb=100))
+        root = Path(c["state_dir"])
+        log = []
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch(log)), \
+             patch("circlestream.controller.reconcile_fetch") as reconcile:
+            self.assertEqual(submit_fetch(c), 4)   # 4 free fetch slots, one sample each, in one pass
+            self.assertEqual(reconcile.call_count, 1)
+            self.assertEqual(submit_fetch(c), 0)   # every fetch slot is taken
+        records = fetch_records(c)
+        self.assertEqual((len(log), len(records), len({r.name for r in records})), (4, 4, 4))
+        self.assertEqual(sorted(s for r in records for s in read_json(r)["samples"]), ["t0", "t1", "t2", "t3"])
+        self.assertEqual([status(root / f"t{i}") for i in range(6)], ["DOWNLOADING"] * 4 + ["NEW"] * 2)
+        c2 = self.slurm_mode(5)
+        c2.update(max_active_samples=3, fetch=dict(c2["fetch"], max_jobs=4, max_samples=1, batch_gb=100))
+        for key in ("state_dir", "scratch_dir", "archive_dir"):
+            c2[key] = c2[key] + "_adm"
+        initialize(c2, self.manifest)
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch([])), \
+             patch("circlestream.controller.reconcile_fetch"):
+            self.assertEqual(submit_fetch(c2), 3)  # admission (max_active_samples=3) ends the pass, not the slots
+        self.assertEqual([status(Path(c2["state_dir"]) / f"t{i}") for i in range(5)], ["DOWNLOADING"] * 3 + ["NEW"] * 2)
+
+    def test_submit_ready_fills_free_job_slots_in_one_pass(self):
+        c = self.slurm_mode(5); c["max_jobs"] = 3
+        root = Path(c["state_dir"])
+        set_status(root / "t0", "RUNNING")
+        for i in range(1, 5):
+            set_status(root / f"t{i}", "READY")
+        log = []
+        with patch("circlestream.controller.subprocess.run", side_effect=self.fake_sbatch(log)), \
+             patch("circlestream.controller.reconcile_jobs") as reconcile:
+            self.assertEqual(submit_ready(c), 2)   # 3 slots, 1 running: both free slots in one pass
+            self.assertEqual(reconcile.call_count, 1)
+            self.assertEqual(submit_ready(c), 0)   # slots full
+            self.assertFalse(submit_one(c))
+            self.assertEqual([status(root / f"t{i}") for i in range(5)], ["RUNNING", "SUBMITTING", "SUBMITTING", "READY", "READY"])
+            c["max_jobs"] = 10
+            self.assertEqual(submit_ready(c, sid="t4"), 1)   # --sample still submits only that sample
+        self.assertEqual([status(root / f"t{i}") for i in (3, 4)], ["READY", "SUBMITTING"])
+        self.assertEqual(len(log), 3)
+        self.assertTrue(all((root / f"t{i}" / "job.json").is_file() for i in (1, 2, 4)))
+
+    def test_submit_ready_stops_at_a_failed_sbatch(self):
+        c = self.slurm_mode(3); c["max_jobs"] = 5
+        root = Path(c["state_dir"])
+        for i in range(3):
+            set_status(root / f"t{i}", "READY")
+        calls = []
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "555\n", "") if len(calls) == 1 else subprocess.CompletedProcess(cmd, 1, "", "error")
+        with patch("circlestream.controller.subprocess.run", side_effect=run), patch("circlestream.controller.reconcile_jobs"):
+            with self.assertRaises(RuntimeError):
+                submit_ready(c)
+        # the uncertain submission is held for review, never retried; the rest wait for the next pass
+        self.assertEqual([status(root / f"t{i}") for i in range(3)], ["SUBMITTING", "SUBMITTING", "READY"])
+        self.assertEqual(((root / "t0" / "job.json").is_file(), (root / "t1" / "job.json").exists()), (True, False))
+        self.assertEqual(len(calls), 2)
 
     def test_reference_store_is_deduplicated_read_only_and_checked(self):
         c = dict(self.c, reference_store=str(self.root / "refstore"))
